@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "sources": {
+    "co.anilist": {
+      "dimensions": [
+        "episode"
+      ],
+      "selections": {}
+    },
+    "com.imdb": {
+      "dimensions": [],
+      "selections": {}
+    },
+    "com.thetvdb": {
+      "dimensions": [
+        "order",
+        "season",
+        "episode"
+      ],
+      "selections": {}
+    },
+    "net.anidb": {
+      "dimensions": [
+        "episode"
+      ],
+      "selections": {}
+    },
+    "net.myanimelist": {
+      "dimensions": [
+        "episode"
+      ],
+      "selections": {}
+    },
+    "org.themoviedb": {
+      "dimensions": [
+        "episode_group",
+        "group",
+        "season",
+        "episode"
+      ],
+      "selections": {}
+    }
+  }
+}
