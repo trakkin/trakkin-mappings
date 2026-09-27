@@ -49,30 +49,6 @@ url = "https://github.com/kjanat/actionlint/releases/download/v1.13.0/actionlint
 url_api = "https://api.github.com/repos/kjanat/actionlint/releases/assets/534417128"
 provenance = "github-attestations"
 
-[[tools.java]]
-version = "27.0.0"
-backend = "core:java"
-specifiers = ["27.0.0"]
-
-[tools.java.options]
-shorthand_vendor = "openjdk"
-
-[tools.java."platforms.linux-arm64"]
-checksum = "sha256:da4e9dde1fff90204739e969187bab4751bd59a2a1c479672e1a1810f7dd23ea"
-url = "https://download.java.net/java/GA/jdk27/55ce5470a6294008af0057ff4626d0e5/35/GPL/openjdk-27_linux-aarch64_bin.tar.gz"
-
-[tools.java."platforms.linux-x64"]
-checksum = "sha256:95fc37eb3a18a27a26d5904c2d89d52bace8dafa9a078ca27f4747fbc4bf070b"
-url = "https://download.java.net/java/GA/jdk27/55ce5470a6294008af0057ff4626d0e5/35/GPL/openjdk-27_linux-x64_bin.tar.gz"
-
-[tools.java."platforms.macos-arm64"]
-checksum = "sha256:ff42134c1bc5ac81c5a91a95fd4df87479db5d0499ba875d6adb5bda5626c3e8"
-url = "https://download.java.net/java/GA/jdk27/55ce5470a6294008af0057ff4626d0e5/35/GPL/openjdk-27_macos-aarch64_bin.tar.gz"
-
-[tools.java."platforms.windows-x64"]
-checksum = "sha256:41172837168dd25a8d9fe5eb253ac1efc568c5f9ff608144bcacadfdf50f876c"
-url = "https://download.java.net/java/GA/jdk27/55ce5470a6294008af0057ff4626d0e5/35/GPL/openjdk-27_windows-x64_bin.zip"
-
 [[tools.node]]
 version = "26.7.0"
 backend = "core:node"

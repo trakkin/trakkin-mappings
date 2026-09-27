@@ -120,6 +120,6 @@ impl Resolver for Adapters {
                 coordinates: None,
             });
         }
-        adapter.selections.get(&selection.canonical()).cloned().with_context(|| format!("missing offline adapter evidence for {}; add a verified resolution to mappings/v1/adapters.json", selection.canonical()))
+        adapter.selections.get(&selection.resolution_key()).cloned().with_context(|| format!("missing offline adapter evidence for {}; add a verified resolution to mappings/v1/adapters.json", selection.resolution_key()))
     }
 }

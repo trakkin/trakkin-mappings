@@ -25,7 +25,7 @@ composite: '[' expression (',' expression)* ']';
 
 // Whitespace around :: is intentional: without it, :: remains part of the opaque reference token.
 selection:
-	REFERENCE (HSPACE SELECTOR_SEPARATOR HSPACE selector)?;
+	REFERENCE (HSPACE SELECTOR_SEPARATOR HSPACE selector)? (HSPACE EXTENT)?;
 
 selector: RECURSIVE_SELECTOR | predicate (',' predicate)*;
 
@@ -40,7 +40,7 @@ rangeValue: scalar RANGE scalar? | RANGE scalar;
 // semantic validator, not by the parser.
 setValue: '{' scalar (',' scalar)* '}';
 
-scalar: QUOTED_SCALAR | IDENTIFIER | BARE_SCALAR;
+scalar: QUOTED_SCALAR | IDENTIFIER | POSITIVE_INTEGER | BARE_SCALAR;
 
 mappingOperator:
 	EXACT_EQUIVALENCE
@@ -68,6 +68,10 @@ RECURSIVE_SELECTOR: '**';
 RANGE: '..';
 
 WILDCARD: '*';
+
+EXTENT: '@' [1-9] [0-9]*;
+
+POSITIVE_INTEGER: [1-9] [0-9]*;
 
 // References are atomic so the core language never parses the opaque value. The value ends only at
 // a reserved reference boundary. Notably, ':' remains legal inside the opaque value, so

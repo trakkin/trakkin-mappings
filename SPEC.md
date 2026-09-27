@@ -77,6 +77,8 @@ net.anidb://anime/6107
 
 Unquoted scalars use a restricted character set: letters, digits, `_`, `-`, `:`, `+`, `%`, and `@`, with single `.` characters allowed as separators. Two consecutive dots are reserved for ranges.
 
+The extent-shaped form `@N`, where `N` is a positive integer, is reserved. A scalar with that exact shape MUST be quoted.
+
 Values requiring other characters MUST be quoted.
 
 Quoted scalars support these escapes:
@@ -170,6 +172,21 @@ Order is significant. Selections may appear inside composites:
 [co.anilist://anime/100 :: episode=1..12,co.anilist://anime/101 :: episode=1..12]
 ```
 
+### 5.1 Relative extent
+
+A selection MAY declare a relative structural extent with `@N`, where `N` is a positive integer:
+
+```text
+a.example://episode/1 @2
+b.example://show/2 :: episode=1..12 @3
+```
+
+An omitted extent means `@1`. Extent applies independently to every synchronization unit resolved from that selection. It MAY appear only on a selection, not on a composite as a whole. A composite's total extent is the sum of its resolved child extents.
+
+Extent is a dimensionless relative measure. Multiplying every extent in a statement by the same positive factor does not change the statement's meaning.
+
+Ordered expressions align by cumulative extent. Unordered sets express collective coverage but do not establish positional boundaries.
+
 ## 6. Mapping operators
 
 The language defines three mapping operators.
@@ -190,15 +207,17 @@ a.example://show/1 :: episode=1..3 <=> b.example://show/2 :: episode=4..6
 
 This form is valid only when both sides have deterministic ordering and equal cardinality.
 
+Corresponding units MUST also have equal extent.
+
 ### 6.2 Collective coverage equivalence: `<~>`
 
 ```text
-a.example://show/1 :: episode=1 <~> b.example://show/2 :: episode={1,2}
+a.example://show/1 :: episode=1 @2 <~> b.example://show/2 :: episode={1,2}
 ```
 
 `<~>` states that both sides cover the same media collectively, without asserting pairwise identity. It is used for 1:N, N:1, and N:M relationships.
 
-Coverage equivalence does not, by itself, define arbitrary fractional-progress translation.
+When both expressions are closed and finite, their total extents MUST be equal. Wildcards, open ranges, and recursive selectors align only the currently shared weighted extent; unmatched tails remain unmapped until source hierarchy data changes.
 
 ### 6.3 Directional state implication: `=>`
 
@@ -209,6 +228,8 @@ a.example://edition/extended => b.example://edition/theatrical
 `=>` states that state on the left safely implies corresponding state on the right. The operator expresses semantic asymmetry, not a user's configured synchronization direction.
 
 It MAY operate positionally over ordered selections of equal cardinality.
+
+It MAY also align unequal cardinalities by cumulative extent when both expressions are ordered. When both expressions are closed and finite, their total extents MUST be equal.
 
 ### 6.4 Non-associativity
 
@@ -231,11 +252,11 @@ a.example://show/1 :: episode=1 <=> b.example://show/2 :: episode=3
 # N:N positional
 a.example://show/1 :: episode=1..12 <=> b.example://show/2 :: episode=13..24
 
-# 1:N
-a.example://show/1 :: episode=1 <~> b.example://show/2 :: episode={1,2}
+# 1:N with equal total extent
+a.example://show/1 :: episode=1 @2 <~> b.example://show/2 :: episode={1,2}
 
-# N:M
-a.example://show/1 :: episode={1,2,3} <~> b.example://show/2 :: episode={4,5}
+# N:M with unequal unit sizes
+a.example://show/1 :: episode={1,2,3} @2 <~> b.example://show/2 :: episode={4,5} @3
 ```
 
 An implementation MUST reject ambiguous positional correspondence instead of inferring one.
@@ -291,6 +312,8 @@ A canonical mapping statement:
 - uses exactly one ASCII space around `::`;
 - contains no unnecessary spaces inside selectors or composites;
 - sorts unordered set values deterministically; and
+- divides all statement extents by their greatest common divisor;
+- omits `@1`; and
 - formats equivalent expressions identically.
 
 For example:
@@ -305,6 +328,18 @@ canonicalizes to:
 episode={1,2,3}
 ```
 
+Similarly:
+
+```text
+a.example://x @2 <~> b.example://y @4
+```
+
+canonicalizes to:
+
+```text
+a.example://x <~> b.example://y @2
+```
+
 Canonical mapping text SHOULD be suitable for hashing, deduplication, deterministic sharding, and stable diffs.
 
 ## 11. Validation
@@ -317,6 +352,8 @@ The semantic validator MUST reject at least the following:
 - duplicate selector dimensions;
 - positional mappings with unequal cardinality;
 - positional mappings without deterministic order;
+- exact mappings with unequal corresponding extents;
+- closed coverage or implication mappings with unequal total extent;
 - implicit zipping of unordered selections;
 - recursive exact mappings whose descendant structures do not correspond; and
 - source-adapter selections that are invalid or ambiguous.
@@ -337,7 +374,7 @@ Each source adapter is responsible for the following:
 - reporting selection cardinality; and
 - rejecting invalid or ambiguous selections.
 
-The core language does not assign intrinsic meaning to dimensions such as `season` or `episode`.
+The core language does not assign intrinsic meaning to dimensions such as `season` or `episode`. Source adapters resolve units independently of extent; the core applies the authored extent after resolution.
 
 ## 13. Representative examples
 
@@ -374,7 +411,7 @@ a.example://show/1 :: episode=1..12 <=> b.example://show/2 :: episode=13..24
 ### Split or combined episode
 
 ```text
-a.example://show/1 :: episode=1 <~> b.example://show/2 :: episode={1,2}
+a.example://show/1 :: episode=1 @2 <~> b.example://show/2 :: episode={1,2}
 ```
 
 ### Different season boundaries
@@ -388,7 +425,7 @@ a.example://show/1 :: season=1,episode=13..24 <=> b.example://show/2 :: season=2
 ### Cour split across top-level entities
 
 ```text
-com.thetvdb://series/123 :: order=aired,season=2 <~> [co.anilist://anime/100,co.anilist://anime/101]
+com.thetvdb://series/123 :: episode=1..12,order=aired,season=2 <~> [co.anilist://anime/100 @6,co.anilist://anime/101 @6]
 ```
 
 ## 14. Core invariants
@@ -405,8 +442,10 @@ Implementations MUST preserve these invariants:
 8. Composites are ordered.
 9. Unordered selections are never implicitly zipped.
 10. Cardinality comes from expressions, not separate operators.
-11. `<=>` means direct synchronization equivalence.
-12. `<~>` means collective coverage equivalence.
-13. `=>` means safe semantic implication.
-14. Coverage equivalence does not imply arbitrary fractional-progress translation.
-15. Ambiguity is rejected rather than guessed.
+11. Omitted extent means `@1` for every resolved synchronization unit.
+12. Extent is relative structure, not synchronization policy.
+13. `<=>` means direct synchronization equivalence with equal corresponding extents.
+14. `<~>` means collective coverage equivalence with aligned total extent.
+15. `=>` means safe semantic implication with left-to-right extent alignment.
+16. Coverage equivalence does not imply arbitrary fractional-progress translation.
+17. Ambiguity is rejected rather than guessed.

@@ -11,5 +11,9 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+antlr-rust-runtime.workspace = true
 serde.workspace = true
 sha2.workspace = true
+
+[build-dependencies]
+antlr-rust-codegen.workspace = true

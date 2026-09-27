@@ -3,7 +3,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
-use trakkin_mappings_language::{Record, Resolved};
+use trakkin_mappings_language::{Record, ResolvedExpression};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -62,7 +62,7 @@ pub fn insert_record(
     connection: &Connection,
     path: &str,
     record: &Record,
-    resolved: &(Resolved, Resolved),
+    resolved: &(ResolvedExpression, ResolvedExpression),
     exclusive: (bool, bool),
 ) -> Result<()> {
     let statement = &record.statement;

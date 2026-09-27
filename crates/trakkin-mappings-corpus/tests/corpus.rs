@@ -142,7 +142,7 @@ fn offline_evidence_enforces_cardinality_and_dimensions() {
     );
     insert(
         root.path(),
-        "a://show :: episode=1..2 <~> b://episode/1",
+        "a://show :: episode=1..2 <~> b://episode/1 @2",
         &adapters,
         false,
     )

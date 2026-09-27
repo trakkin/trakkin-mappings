@@ -2,12 +2,13 @@ mod parser;
 mod validation;
 
 pub use parser::parse;
-pub use validation::{Resolved, Resolver, validate};
+pub use validation::{Resolved, ResolvedExpression, Resolver, validate};
 
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 pub const ID_VERSION: &str = "trakkin:statement:v1\0";
 
@@ -29,6 +30,8 @@ pub enum Selector {
 pub struct Selection {
     pub reference: String,
     pub selector: Option<Selector>,
+    #[serde(default = "default_extent")]
+    pub extent: NonZeroU64,
 }
 
 impl Selection {
@@ -37,6 +40,10 @@ impl Selection {
     }
 
     pub fn canonical(&self) -> String {
+        self.canonical_with_extent_divisor(1)
+    }
+
+    pub fn resolution_key(&self) -> String {
         let mut text = self.reference.clone();
         if let Some(selector) = &self.selector {
             text.push_str(" :: ");
@@ -53,6 +60,19 @@ impl Selection {
         }
         text
     }
+
+    fn canonical_with_extent_divisor(&self, divisor: u64) -> String {
+        let mut text = self.resolution_key();
+        let extent = self.extent.get() / divisor;
+        if extent != 1 {
+            text.push_str(&format!(" @{extent}"));
+        }
+        text
+    }
+}
+
+fn default_extent() -> NonZeroU64 {
+    NonZeroU64::new(1).unwrap()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,13 +83,17 @@ pub enum Expression {
 
 impl Expression {
     pub fn canonical(&self) -> String {
+        self.canonical_with_extent_divisor(1)
+    }
+
+    fn canonical_with_extent_divisor(&self, divisor: u64) -> String {
         match self {
-            Self::Selection(selection) => selection.canonical(),
+            Self::Selection(selection) => selection.canonical_with_extent_divisor(divisor),
             Self::Composite(expressions) => format!(
                 "[{}]",
                 expressions
                     .iter()
-                    .map(Self::canonical)
+                    .map(|expression| expression.canonical_with_extent_divisor(divisor))
                     .collect::<Vec<_>>()
                     .join(",")
             ),
@@ -80,6 +104,19 @@ impl Expression {
         match self {
             Self::Selection(selection) => vec![selection],
             Self::Composite(expressions) => expressions.iter().flat_map(Self::selections).collect(),
+        }
+    }
+
+    fn divide_extents(&mut self, divisor: u64) {
+        match self {
+            Self::Selection(selection) => {
+                selection.extent = NonZeroU64::new(selection.extent.get() / divisor).unwrap();
+            }
+            Self::Composite(expressions) => {
+                for expression in expressions {
+                    expression.divide_extents(divisor);
+                }
+            }
         }
     }
 }
@@ -110,11 +147,12 @@ pub struct Statement {
 
 impl Statement {
     pub fn canonical(&self) -> String {
+        let divisor = self.extent_divisor();
         format!(
             "{} {} {}",
-            self.left.canonical(),
+            self.left.canonical_with_extent_divisor(divisor),
             self.operator.text(),
-            self.right.canonical()
+            self.right.canonical_with_extent_divisor(divisor)
         )
     }
 
@@ -123,7 +161,11 @@ impl Statement {
     }
 
     pub fn relation_key(&self) -> String {
-        let mut sides = [self.left.canonical(), self.right.canonical()];
+        let divisor = self.extent_divisor();
+        let mut sides = [
+            self.left.canonical_with_extent_divisor(divisor),
+            self.right.canonical_with_extent_divisor(divisor),
+        ];
         if self.operator != Operator::Implication {
             sides.sort();
         }
@@ -132,6 +174,29 @@ impl Statement {
             format!("{} {} {}", sides[0], self.operator.text(), sides[1]).as_bytes(),
         ])
     }
+
+    pub(crate) fn normalize_extents(&mut self) {
+        let divisor = self.extent_divisor();
+        self.left.divide_extents(divisor);
+        self.right.divide_extents(divisor);
+    }
+
+    fn extent_divisor(&self) -> u64 {
+        self.left
+            .selections()
+            .into_iter()
+            .chain(self.right.selections())
+            .map(|selection| selection.extent.get())
+            .reduce(greatest_common_divisor)
+            .unwrap_or(1)
+    }
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -56,6 +56,39 @@ fn all_language_constructs_round_trip() {
 }
 
 #[test]
+fn explicit_extent_round_trips() {
+    let text = "a://x @2 <~> b://y";
+    let record = parse(text).unwrap().remove(0);
+    assert_eq!(record.statement.canonical(), text);
+    assert_eq!(record.statement.left.selections()[0].extent.get(), 2);
+}
+
+#[test]
+fn extent_ratios_are_canonicalized_statement_wide() {
+    let scaled = parse("[a://x @2,a://y @4] <~> [b://x @2,b://y @4]")
+        .unwrap()
+        .remove(0);
+    let reduced = parse("[a://x,a://y @2] <~> [b://x,b://y @2]")
+        .unwrap()
+        .remove(0);
+    assert_eq!(scaled.statement.canonical(), reduced.statement.canonical());
+    assert_eq!(scaled.statement.id(), reduced.statement.id());
+    assert_eq!(parse(&scaled.canonical()).unwrap().remove(0), scaled);
+    assert_eq!(
+        parse("a://x @1 <~> b://y @1").unwrap()[0]
+            .statement
+            .canonical(),
+        "a://x <~> b://y"
+    );
+    assert_ne!(
+        reduced.statement.id(),
+        parse("[a://x,a://y @3] <~> [b://x,b://y @2]").unwrap()[0]
+            .statement
+            .id()
+    );
+}
+
+#[test]
 fn malformed_input_is_rejected() {
     for text in [
         "\n",
@@ -70,6 +103,11 @@ fn malformed_input_is_rejected() {
         "a://x :: episode=.. <=> b://y",
         "a://x :: episode=1...2 <=> b://y",
         "a://x :: edition=\"\\u0041\" <=> b://y",
+        "a://x @0 <~> b://y",
+        "a://x @ <~> b://y",
+        "a://x @-1 <~> b://y",
+        "[a://x] @2 <~> b://y",
+        "a://x @18446744073709551616 <~> b://y",
         "[] <=> b://y",
         "[a://x, b://y] <=> c://z",
         "a://x <=> b://y <=> c://z",
@@ -115,8 +153,12 @@ fn corpus_metadata_is_separate_from_identity() {
 struct FixtureResolver;
 impl Resolver for FixtureResolver {
     fn resolve(&self, selection: &Selection) -> anyhow::Result<Resolved> {
-        let text = selection.canonical();
-        let count = if text.contains("1..2") || text.contains("{1,2}") || text.contains("**") {
+        let text = selection.resolution_key();
+        let count = if text.contains("1..2")
+            || text.contains("{1,2}")
+            || text.contains("=*")
+            || text.contains("**")
+        {
             2
         } else {
             1
@@ -145,13 +187,18 @@ fn positional_and_recursive_semantics() {
     for text in [
         "a://x <=> b://y",
         "a://x :: episode=1..2 <=> b://y :: episode=1..2",
-        "a://x <~> b://y :: episode={1,2}",
+        "a://x @2 <~> b://y :: episode={1,2}",
+        "a://x @2 => b://y :: episode=1..2",
+        "a://x :: episode=* @2 <~> b://y",
         "a://x :: ** <=> b://y :: **",
     ] {
         validate(&parse(text).unwrap()[0].statement, &FixtureResolver).unwrap();
     }
     for text in [
         "a://x <=> b://y :: episode=1..2",
+        "a://x <~> b://y :: episode={1,2}",
+        "a://x <=> b://y @2",
+        "a://x => b://y :: episode=1..2",
         "a://x :: episode={1,2} => b://y :: episode=1..2",
         "a://x :: ** <=> bad://y :: **",
         "a://x :: ** <=> b://y :: episode=1..2",
@@ -161,4 +208,11 @@ fn positional_and_recursive_semantics() {
             "{text}"
         );
     }
+
+    let split = parse("a://x @2 <~> b://y :: episode=1..2")
+        .unwrap()
+        .remove(0);
+    let (left, right) = validate(&split.statement, &FixtureResolver).unwrap();
+    assert_eq!(left.extents, [2]);
+    assert_eq!(right.extents, [1, 1]);
 }
