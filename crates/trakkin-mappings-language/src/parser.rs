@@ -62,13 +62,23 @@ where
     let mut record_start_byte = 0_u64;
     let mut record_start_line = 1_u64;
     let mut ordinal = 0_u64;
+    let mut line = Vec::new();
 
     loop {
-        let mut line = Vec::new();
+        line.clear();
         let line_start_byte = source_bytes;
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
-            .context("failed to read mapping document")?;
+        let next_record_start_line = if record_bytes.is_empty() {
+            line_number + 1
+        } else {
+            record_start_line
+        };
+        let bytes_read = read_bounded_line(
+            &mut reader,
+            &mut line,
+            record_bytes.len(),
+            max_record_bytes,
+            next_record_start_line,
+        )?;
         if bytes_read == 0 {
             break;
         }
@@ -78,13 +88,6 @@ where
             record_start_byte = line_start_byte;
             record_start_line = line_number;
         }
-        ensure!(
-            record_bytes
-                .len()
-                .checked_add(line.len())
-                .is_some_and(|length| length <= max_record_bytes),
-            "mapping record beginning at line {record_start_line} exceeds the {max_record_bytes}-byte limit"
-        );
         record_bytes.extend_from_slice(&line);
         if line.starts_with(b"#") {
             continue;
@@ -117,6 +120,42 @@ where
         )?)?;
     }
     Ok(())
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    record_bytes: usize,
+    max_record_bytes: usize,
+    record_start_line: u64,
+) -> Result<usize> {
+    loop {
+        let (length, complete) = {
+            let available = reader
+                .fill_buf()
+                .context("failed to read mapping document")?;
+            if available.is_empty() {
+                return Ok(line.len());
+            }
+            let chunk_length = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            ensure!(
+                record_bytes
+                    .checked_add(line.len())
+                    .and_then(|length| length.checked_add(chunk_length))
+                    .is_some_and(|record_length| record_length <= max_record_bytes),
+                "mapping record beginning at line {record_start_line} exceeds the {max_record_bytes}-byte limit"
+            );
+            line.extend_from_slice(&available[..chunk_length]);
+            (chunk_length, available[chunk_length - 1] == b'\n')
+        };
+        reader.consume(length);
+        if complete {
+            return Ok(line.len());
+        }
+    }
 }
 
 fn parse_located_record(bytes: &[u8], ordinal: u64, span: SourceSpan) -> Result<LocatedRecord> {

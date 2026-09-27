@@ -105,6 +105,16 @@ fn streaming_parser_enforces_limits_and_rejects_orphan_metadata() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("invalid mapping record"), "{error}");
+
+    let unterminated = vec![b'a'; 1024];
+    let error = visit_records(
+        BufReader::with_capacity(8, Cursor::new(unterminated)),
+        32,
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("exceeds the 32-byte limit"), "{error}");
 }
 
 #[test]

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 pub const ID_VERSION: &str = "trakkin:statement:v1\0";
+pub const RELATION_KEY_VERSION: &str = "trakkin:relation:v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
@@ -170,7 +171,7 @@ impl Statement {
             sides.sort();
         }
         digest(&[
-            b"trakkin:relation:v1\0",
+            RELATION_KEY_VERSION.as_bytes(),
             format!("{} {} {}", sides[0], self.operator.text(), sides[1]).as_bytes(),
         ])
     }

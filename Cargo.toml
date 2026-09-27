@@ -3,6 +3,7 @@ members = [
   "crates/trakkin-mappings-language",
   "crates/trakkin-mappings-corpus",
   "crates/trakkin-mappings-index",
+  "crates/trakkin-mappings-compiler",
   "crates/trakkin-mappings-cli",
 ]
 resolver = "3"
@@ -29,6 +30,7 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 trakkin-mappings-corpus = { path = "crates/trakkin-mappings-corpus" }
+trakkin-mappings-compiler = { path = "crates/trakkin-mappings-compiler" }
 trakkin-mappings-index = { path = "crates/trakkin-mappings-index" }
 trakkin-mappings-language = { path = "crates/trakkin-mappings-language" }
 zstd = "0.13.3"

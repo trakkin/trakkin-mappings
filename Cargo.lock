@@ -789,6 +789,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "trakkin-mappings-compiler"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "trakkin-mappings-language",
+]
+
+[[package]]
 name = "trakkin-mappings-corpus"
 version = "0.0.0"
 dependencies = [
