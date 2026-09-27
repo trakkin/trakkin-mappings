@@ -1,0 +1,11 @@
+{
+  "recommendations": [
+    "github.vscode-github-actions",
+    "hverlin.mise-vscode",
+    "mike-lischke.vscode-antlr4",
+    "redhat.vscode-yaml",
+    "rust-lang.rust-analyzer",
+    "tamasfe.even-better-toml",
+    "yzhang.markdown-all-in-one"
+  ]
+}

@@ -1,0 +1,76 @@
+[settings]
+lockfile = true
+minimum_release_age = "3d"
+
+[tools]
+"github:kjanat/actionlint" = "1.13.0"
+"npm:actions-up" = "1.18.0"
+java = "27.0.0"
+node = "26.7.0"
+rust = "1.97.1"
+
+[tasks.fix]
+description = "Fix CLI issues"
+run = [{ task = "cli:fix" }]
+
+[tasks."cli:fix"]
+description = "Apply automated CLI lint fixes"
+run = "cargo clippy --fix --workspace --all-targets --all-features --allow-dirty"
+
+[tasks.format]
+description = "Format CLI sources"
+run = [{ task = "cli:format" }]
+
+[tasks."cli:format"]
+description = "Format CLI sources"
+run = "cargo fmt --all"
+
+[tasks.setup]
+description = "Set CLI dependencies"
+run = [{ tasks = ["cli:setup"] }]
+
+[tasks."cli:setup"]
+description = "Fetch locked CLI dependencies"
+run = "cargo fetch --locked"
+
+[tasks.check]
+description = "Check CLI and workflows sources"
+run = [{ tasks = ["workflows:check", "cli:check"] }]
+
+[tasks."cli:check"]
+description = "Check CLI lints"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks."workflows:check"]
+description = "Check GitHub Actions workflows"
+run = "actionlint"
+
+[tasks.test]
+description = "Run CLI tests"
+run = [{ task = "cli:test" }]
+
+[tasks."cli:test"]
+description = "Run CLI tests"
+run = "cargo test --workspace --all-features"
+
+[tasks.update]
+description = "Update the toolchain, workflows, and CLI dependencies"
+run = [
+  { task = "toolchain:update" },
+  { tasks = [
+    "workflows:update",
+    "cli:update",
+  ] },
+]
+
+[tasks."workflows:update"]
+description = "Update and SHA-pin GitHub Actions dependencies"
+run = "actions-up --yes"
+
+[tasks."cli:update"]
+description = "Update CLI dependencies"
+run = "cargo upgrade --incompatible allow --pinned allow"
+
+[tasks."toolchain:update"]
+description = "Update mise-managed tools"
+run = "mise upgrade --bump"

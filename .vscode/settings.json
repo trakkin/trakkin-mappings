@@ -1,0 +1,20 @@
+{
+  "[markdown]": {
+    "editor.wordWrap": "wordWrapColumn",
+    "editor.wordWrapColumn": 120,
+    "editor.rulers": [
+      120
+    ]
+  },
+  "[antlr]": {
+    "editor.defaultFormatter": "mike-lischke.vscode-antlr4"
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.tabSize": 4
+  },
+  "editor.formatOnSave": true,
+  "editor.insertSpaces": true,
+  "editor.tabSize": 2,
+  "rust-analyzer.check.command": "clippy"
+}
