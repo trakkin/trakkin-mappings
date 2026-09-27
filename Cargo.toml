@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/trakkin-mappings-language",
+  "crates/trakkin-mappings-corpus",
+  "crates/trakkin-mappings-index",
+  "crates/trakkin-mappings-cli",
+]
+resolver = "3"
+
+[workspace.package]
+authors = ["Elias Benbourenane"]
+edition = "2024"
+homepage = "https://trakkin.dev"
+license = "AGPL-3.0-only"
+publish = false
+repository = "https://github.com/trakkin/trakkin-mappings"
+rust-version = "1.97.1"
+version = "0.0.0"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+fs2 = "0.4.3"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+trakkin-mappings-corpus = { path = "crates/trakkin-mappings-corpus" }
+trakkin-mappings-index = { path = "crates/trakkin-mappings-index" }
+trakkin-mappings-language = { path = "crates/trakkin-mappings-language" }
+zstd = "0.13.3"
