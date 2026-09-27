@@ -2,6 +2,7 @@ use crate::{Expression, Operator, Record, Selection, Selector, Statement, Value}
 use antlr4_runtime::{CommonTokenStream, InputStream};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeMap;
+use std::io::BufRead;
 use std::num::NonZeroU64;
 
 mod generated_lexer {
@@ -18,6 +19,21 @@ use generated_parser::{
     SelectorContext, SelectorValueContext, StatementContext, ValidatedTreeContext,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub start_line: u64,
+    pub end_line: u64,
+    pub start_byte: u64,
+    pub end_byte: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedRecord {
+    pub ordinal: u64,
+    pub span: SourceSpan,
+    pub record: Record,
+}
+
 pub fn parse(text: &str) -> Result<Vec<Record>> {
     let mut lexer = TrakkinLexer::new(InputStream::new(text));
     lexer.remove_error_listeners();
@@ -32,6 +48,99 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
         .downcast_ref::<DocumentContext<ValidatedTreeContext>>()
         .context("mapping parser returned an unexpected root")?;
     document.mapping_record_children().map(record).collect()
+}
+
+pub fn visit_records<R, F>(mut reader: R, max_record_bytes: usize, mut visitor: F) -> Result<()>
+where
+    R: BufRead,
+    F: FnMut(LocatedRecord) -> Result<()>,
+{
+    ensure!(max_record_bytes > 0, "record size limit must be positive");
+    let mut record_bytes = Vec::new();
+    let mut source_bytes = 0_u64;
+    let mut line_number = 0_u64;
+    let mut record_start_byte = 0_u64;
+    let mut record_start_line = 1_u64;
+    let mut ordinal = 0_u64;
+
+    loop {
+        let mut line = Vec::new();
+        let line_start_byte = source_bytes;
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .context("failed to read mapping document")?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        source_bytes += bytes_read as u64;
+        if record_bytes.is_empty() {
+            record_start_byte = line_start_byte;
+            record_start_line = line_number;
+        }
+        ensure!(
+            record_bytes
+                .len()
+                .checked_add(line.len())
+                .is_some_and(|length| length <= max_record_bytes),
+            "mapping record beginning at line {record_start_line} exceeds the {max_record_bytes}-byte limit"
+        );
+        record_bytes.extend_from_slice(&line);
+        if line.starts_with(b"#") {
+            continue;
+        }
+
+        visitor(parse_located_record(
+            &record_bytes,
+            ordinal,
+            SourceSpan {
+                start_line: record_start_line,
+                end_line: line_number,
+                start_byte: record_start_byte,
+                end_byte: source_bytes,
+            },
+        )?)?;
+        ordinal += 1;
+        record_bytes.clear();
+    }
+
+    if !record_bytes.is_empty() {
+        visitor(parse_located_record(
+            &record_bytes,
+            ordinal,
+            SourceSpan {
+                start_line: record_start_line,
+                end_line: line_number,
+                start_byte: record_start_byte,
+                end_byte: source_bytes,
+            },
+        )?)?;
+    }
+    Ok(())
+}
+
+fn parse_located_record(bytes: &[u8], ordinal: u64, span: SourceSpan) -> Result<LocatedRecord> {
+    let text = std::str::from_utf8(bytes).with_context(|| {
+        format!(
+            "mapping record at lines {}-{} is not UTF-8",
+            span.start_line, span.end_line
+        )
+    })?;
+    let mut records = parse(text).with_context(|| {
+        format!(
+            "invalid mapping record at lines {}-{}",
+            span.start_line, span.end_line
+        )
+    })?;
+    ensure!(
+        records.len() == 1,
+        "mapping record parser returned no record"
+    );
+    Ok(LocatedRecord {
+        ordinal,
+        span,
+        record: records.remove(0),
+    })
 }
 
 fn record(context: MappingRecordContext<'_, ValidatedTreeContext>) -> Result<Record> {

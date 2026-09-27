@@ -1,4 +1,7 @@
-use trakkin_mappings_language::{Resolved, Resolver, Selection, parse, validate};
+use std::io::{BufReader, Cursor};
+use trakkin_mappings_language::{
+    LocatedRecord, Resolved, Resolver, Selection, parse, validate, visit_records,
+};
 
 #[test]
 fn canonicalization_and_identity() {
@@ -53,6 +56,55 @@ fn all_language_constructs_round_trip() {
         assert_eq!(parse(&canonical).unwrap(), records);
     }
     assert!(parse("").unwrap().is_empty());
+}
+
+#[test]
+fn streaming_parser_visits_bounded_records_with_source_spans() {
+    let text = "#@note first\r\na://x <=> b://y\r\nc://z => d://w";
+    let mut records = Vec::<LocatedRecord>::new();
+    visit_records(
+        BufReader::with_capacity(1, Cursor::new(text.as_bytes())),
+        1024,
+        |record| {
+            records.push(record);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].ordinal, 0);
+    assert_eq!(records[0].span.start_line, 1);
+    assert_eq!(records[0].span.end_line, 2);
+    assert_eq!(records[0].span.start_byte, 0);
+    assert_eq!(
+        records[0].span.end_byte as usize,
+        text.find("c://z").unwrap()
+    );
+    assert_eq!(records[0].record.metadata, ["#@note first"]);
+    assert_eq!(records[1].ordinal, 1);
+    assert_eq!(records[1].span.start_line, 3);
+    assert_eq!(records[1].span.end_line, 3);
+    assert_eq!(
+        records[1].span.start_byte as usize,
+        text.find("c://z").unwrap()
+    );
+    assert_eq!(records[1].span.end_byte as usize, text.len());
+    assert_eq!(records[1].record.statement.canonical(), "c://z => d://w");
+}
+
+#[test]
+fn streaming_parser_enforces_limits_and_rejects_orphan_metadata() {
+    let text = "#@note first\na://x <=> b://y\n";
+    let error = visit_records(Cursor::new(text.as_bytes()), text.len() - 1, |_| Ok(()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exceeds the"), "{error}");
+
+    let error = visit_records(Cursor::new(b"# orphan\n"), 1024, |_| Ok(()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("invalid mapping record"), "{error}");
 }
 
 #[test]

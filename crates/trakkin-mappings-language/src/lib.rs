@@ -1,7 +1,7 @@
 mod parser;
 mod validation;
 
-pub use parser::parse;
+pub use parser::{LocatedRecord, SourceSpan, parse, visit_records};
 pub use validation::{Resolved, ResolvedExpression, Resolver, validate};
 
 use anyhow::{Result, bail, ensure};
