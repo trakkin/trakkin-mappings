@@ -1,12 +1,12 @@
-use crate::{Expression, Operator, Selection, Selector, Statement, Value};
+use crate::{Expression, Operator, Selection, Selector, Statement, Value, digest, parse_unit_key};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt::Debug};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resolved {
-    pub items: Vec<String>,
+    pub units: Vec<String>,
     pub ordered: bool,
     #[serde(default)]
     pub coordinates: Option<Vec<String>>,
@@ -15,31 +15,57 @@ pub struct Resolved {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedExpression {
-    pub items: Vec<String>,
+    pub units: Vec<String>,
     pub extents: Vec<u64>,
     pub ordered: bool,
     #[serde(default)]
     pub coordinates: Option<Vec<String>>,
 }
 
-pub trait Resolver {
+pub trait Resolver: Debug + Send + Sync {
+    fn evidence_fingerprint(&self) -> String;
+    fn validate_selection(&self, _selection: &Selection) -> Result<()> {
+        Ok(())
+    }
     fn resolve(&self, selection: &Selection) -> Result<Resolved>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdentityResolver;
+
+impl Resolver for IdentityResolver {
+    fn evidence_fingerprint(&self) -> String {
+        digest(&[b"trakkin:identity-resolution:v1\0"])
+    }
+
+    fn resolve(&self, selection: &Selection) -> Result<Resolved> {
+        ensure!(
+            selection.selector.is_none(),
+            "selector resolution evidence is missing for {}",
+            selection.selection_key()
+        );
+        Ok(Resolved {
+            units: vec![selection.reference.clone()],
+            ordered: true,
+            coordinates: None,
+        })
+    }
 }
 
 pub fn validate(
     statement: &Statement,
-    resolver: &impl Resolver,
+    resolver: &(impl Resolver + ?Sized),
 ) -> Result<(ResolvedExpression, ResolvedExpression)> {
     let left = resolve_expression(&statement.left, resolver)?;
     let right = resolve_expression(&statement.right, resolver)?;
     match statement.operator {
         Operator::Exact => {
             ensure!(
-                left.items.len() == right.items.len(),
+                left.units.len() == right.units.len(),
                 "exact mapping has unequal cardinality"
             );
             ensure!(
-                left.items.len() == 1 || (left.ordered && right.ordered),
+                left.units.len() == 1 || (left.ordered && right.ordered),
                 "unordered selections cannot be implicitly zipped"
             );
             ensure!(
@@ -58,7 +84,7 @@ pub fn validate(
         }
         Operator::Implication => {
             ensure!(
-                (left.items.len() == 1 && right.items.len() == 1)
+                (left.units.len() == 1 && right.units.len() == 1)
                     || (left.ordered && right.ordered),
                 "unordered selections cannot be aligned by extent"
             );
@@ -110,20 +136,37 @@ fn expression_is_closed(expression: &Expression) -> bool {
 
 fn resolve_expression(
     expression: &Expression,
-    resolver: &impl Resolver,
+    resolver: &(impl Resolver + ?Sized),
 ) -> Result<ResolvedExpression> {
     match expression {
         Expression::Selection(selection) => {
-            let result = resolver.resolve(selection)?;
+            resolver.validate_selection(selection)?;
+            let result = if selection.selector.is_none() {
+                Resolved {
+                    units: vec![selection.reference.clone()],
+                    ordered: true,
+                    coordinates: None,
+                }
+            } else {
+                resolver.resolve(selection)?
+            };
             ensure!(
-                !result.items.is_empty(),
+                !result.units.is_empty(),
                 "selection resolves to no synchronization units"
             );
             ensure!(
-                result.items.iter().all(|item| !item.is_empty())
-                    && result.items.iter().collect::<BTreeSet<_>>().len() == result.items.len(),
+                result.units.iter().all(|unit| !unit.is_empty())
+                    && result.units.iter().collect::<BTreeSet<_>>().len() == result.units.len(),
                 "selection has invalid or repeated units"
             );
+            for unit_key in &result.units {
+                let unit =
+                    parse_unit_key(unit_key).context("resolver returned an invalid unit key")?;
+                ensure!(
+                    unit.source() == selection.source(),
+                    "resolver returned a unit outside the selection source"
+                );
+            }
             if matches!(selection.selector, Some(Selector::Recursive)) {
                 ensure!(
                     result.coordinates.is_some(),
@@ -137,7 +180,7 @@ fn resolve_expression(
             }
             if let Some(coordinates) = &result.coordinates {
                 ensure!(
-                    coordinates.len() == result.items.len()
+                    coordinates.len() == result.units.len()
                         && coordinates.iter().collect::<BTreeSet<_>>().len() == coordinates.len(),
                     "invalid recursive coordinates"
                 );
@@ -162,15 +205,15 @@ fn resolve_expression(
                 }
             }
             Ok(ResolvedExpression {
-                extents: vec![selection.extent.get(); result.items.len()],
-                items: result.items,
+                extents: vec![selection.extent.get(); result.units.len()],
+                units: result.units,
                 ordered: result.ordered,
                 coordinates: result.coordinates,
             })
         }
         Expression::Composite(expressions) => {
             let mut result = ResolvedExpression {
-                items: Vec::new(),
+                units: Vec::new(),
                 extents: Vec::new(),
                 ordered: true,
                 coordinates: None,
@@ -179,7 +222,7 @@ fn resolve_expression(
             let mut recursive = false;
             for (index, expression) in expressions.iter().enumerate() {
                 let resolved = resolve_expression(expression, resolver)?;
-                result.ordered &= resolved.ordered || resolved.items.len() == 1;
+                result.ordered &= resolved.ordered || resolved.units.len() == 1;
                 if let Some(child_coordinates) = resolved.coordinates {
                     recursive = true;
                     coordinates.extend(
@@ -189,13 +232,13 @@ fn resolve_expression(
                     );
                 } else {
                     coordinates
-                        .extend((0..resolved.items.len()).map(|unit| format!("{index}/@{unit}")));
+                        .extend((0..resolved.units.len()).map(|unit| format!("{index}/@{unit}")));
                 }
-                result.items.extend(resolved.items);
+                result.units.extend(resolved.units);
                 result.extents.extend(resolved.extents);
             }
             ensure!(
-                result.items.iter().collect::<BTreeSet<_>>().len() == result.items.len(),
+                result.units.iter().collect::<BTreeSet<_>>().len() == result.units.len(),
                 "composite repeats a synchronization unit"
             );
             if recursive {

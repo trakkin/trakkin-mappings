@@ -1,6 +1,7 @@
 use std::io::{BufReader, Cursor};
 use trakkin_mappings_language::{
-    LocatedRecord, Resolved, Resolver, Selection, parse, validate, visit_records,
+    LocatedRecord, Resolved, Resolver, Selection, parse, parse_selection_key, parse_unit_key,
+    validate, visit_records,
 };
 
 #[test]
@@ -28,6 +29,28 @@ fn canonicalization_and_identity() {
 }
 
 #[test]
+fn parses_canonical_selection_and_unit_keys() {
+    let key = "com.thetvdb://series/123 :: episode=2,order=aired,season=1";
+    assert_eq!(parse_selection_key(key).unwrap().selection_key(), key);
+    assert!(parse_unit_key(key).is_err());
+    assert_eq!(
+        parse_unit_key("com.thetvdb://episodes/456")
+            .unwrap()
+            .reference,
+        "com.thetvdb://episodes/456"
+    );
+
+    for invalid in [
+        "com.thetvdb://series/123 :: season=1,episode=2,order=aired",
+        "com.thetvdb://series/123 @2",
+        "[com.thetvdb://series/123]",
+        "com.thetvdb://series/123 <=> org.themoviedb://tv/456",
+    ] {
+        assert!(parse_selection_key(invalid).is_err(), "accepted {invalid}");
+    }
+}
+
+#[test]
 fn mapping_identity_v1_has_a_stable_golden_hash() {
     let record = parse("com.imdb://title/tt0133093 <=> org.themoviedb://movie/603")
         .unwrap()
@@ -48,6 +71,7 @@ fn all_language_constructs_round_trip() {
         "a://x :: season=1,episode=* <~> b://y :: episode=..12",
         "a://x :: edition=\"a,b [c]\\n\\r\\t\\\"\\\\\" => b://y",
         "a://x :: value=\"\" <=> b://y :: value=+1.5",
+        "a://x :: value=\"@1\" <=> b://y :: value=\"@999\"",
         "# comment\r\n#@custom opaque payload\r\na://x <=> b://y\r\n",
         "#@custom  \na://x <=> b://y\n",
     ] {
@@ -212,10 +236,15 @@ fn corpus_metadata_is_separate_from_identity() {
     );
 }
 
+#[derive(Debug)]
 struct FixtureResolver;
 impl Resolver for FixtureResolver {
+    fn evidence_fingerprint(&self) -> String {
+        "fixture-resolution-v1".to_owned()
+    }
+
     fn resolve(&self, selection: &Selection) -> anyhow::Result<Resolved> {
-        let text = selection.resolution_key();
+        let text = selection.selection_key();
         let count = if text.contains("1..2")
             || text.contains("{1,2}")
             || text.contains("=*")
@@ -226,7 +255,7 @@ impl Resolver for FixtureResolver {
             1
         };
         Ok(Resolved {
-            items: (0..count)
+            units: (0..count)
                 .map(|index| format!("{}:{index}", selection.reference))
                 .collect(),
             ordered: !text.contains('{'),
@@ -242,6 +271,15 @@ impl Resolver for FixtureResolver {
             }),
         })
     }
+}
+
+#[test]
+fn bare_references_resolve_to_themselves_without_adapter_inference() {
+    let statement = parse("a://show <=> b://show").unwrap().remove(0).statement;
+    let (left, right) = validate(&statement, &FixtureResolver).unwrap();
+
+    assert_eq!(left.units, ["a://show"]);
+    assert_eq!(right.units, ["b://show"]);
 }
 
 #[test]

@@ -49,7 +49,7 @@ impl Adapters {
                 );
                 ensure!(
                     resolved
-                        .items
+                        .units
                         .iter()
                         .all(|item| item.starts_with(&format!("{namespace}://"))),
                     "resolved units must be source-qualified"
@@ -82,7 +82,11 @@ fn positive_integer(value: &str) -> bool {
 }
 
 impl Resolver for Adapters {
-    fn resolve(&self, selection: &Selection) -> Result<Resolved> {
+    fn evidence_fingerprint(&self) -> String {
+        self.fingerprint()
+    }
+
+    fn validate_selection(&self, selection: &Selection) -> Result<()> {
         let adapter = self
             .sources
             .get(selection.source())
@@ -113,13 +117,14 @@ impl Resolver for Adapters {
                 );
             }
         }
-        if selection.selector.is_none() {
-            return Ok(Resolved {
-                items: vec![selection.reference.clone()],
-                ordered: true,
-                coordinates: None,
-            });
-        }
-        adapter.selections.get(&selection.resolution_key()).cloned().with_context(|| format!("missing offline adapter evidence for {}; add a verified resolution to mappings/v1/adapters.json", selection.resolution_key()))
+        Ok(())
+    }
+
+    fn resolve(&self, selection: &Selection) -> Result<Resolved> {
+        let adapter = self
+            .sources
+            .get(selection.source())
+            .with_context(|| format!("no adapter configured for {}", selection.source()))?;
+        adapter.selections.get(&selection.selection_key()).cloned().with_context(|| format!("missing offline adapter evidence for {}; add a verified resolution to mappings/v1/adapters.json", selection.selection_key()))
     }
 }

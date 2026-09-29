@@ -102,7 +102,7 @@ pub fn insert_record(
     if statement.operator == trakkin_mappings_language::Operator::Exact {
         let left_source = statement.left.selections()[0].source();
         let right_source = statement.right.selections()[0].source();
-        for (left, right) in resolved.0.items.iter().zip(&resolved.1.items) {
+        for (left, right) in resolved.0.units.iter().zip(&resolved.1.units) {
             for (origin, target_source, target, exclusive) in [
                 (left, right_source, right, exclusive.0),
                 (right, left_source, left, exclusive.1),

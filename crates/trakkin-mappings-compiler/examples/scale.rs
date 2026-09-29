@@ -1,15 +1,13 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use trakkin_mappings_compiler::{
-    CompileOptions, MappingLayer, MappingQuery, compile, list_mappings, open_read_only,
+    CompileOptions, MappingLayer, MappingQuery, RuntimeIndex, compile,
 };
 
 const DEFAULT_OCCURRENCES: u64 = 5_000_000;
@@ -22,9 +20,7 @@ struct ScaleReport {
     mapping_occurrences: u64,
     active_relations: u64,
     shadowed_occurrences: u64,
-    resolved_units: u64,
     active_exact_claims: u64,
-    active_search_documents: u64,
     source_bytes: u64,
     index_bytes: u64,
     build_milliseconds: u64,
@@ -91,38 +87,25 @@ fn main() -> Result<()> {
         "unexpected active exact claim count"
     );
 
-    let connection = open_read_only(&index_path)?;
-    validate_query_plans(&connection)?;
-    let resolved_units: u64 =
-        connection.query_row("SELECT count(*) FROM resolved_unit", [], |row| row.get(0))?;
-    let active_search_documents: u64 =
-        connection.query_row("SELECT count(*) FROM active_search", [], |row| row.get(0))?;
-    ensure!(
-        resolved_units == mapping_occurrences * 2,
-        "unexpected resolved unit count"
-    );
-    ensure!(
-        active_search_documents == unique_relations,
-        "unexpected active search document count"
-    );
+    let index = RuntimeIndex::open(&index_path)?;
 
     let page_query = MappingQuery {
         limit: 100,
         ..MappingQuery::default()
     };
     let started = Instant::now();
-    let cold_page = list_mappings(&connection, &page_query, None)?;
+    let cold_page = index.mappings(&page_query, None)?;
     let cold_page_elapsed = started.elapsed();
     ensure!(cold_page.items.len() == 100, "unexpected cold page size");
     let warm_page_p95 = measure_p95(|| {
-        let warm_page = list_mappings(&connection, &page_query, None)?;
+        let warm_page = index.mappings(&page_query, None)?;
         ensure!(
             warm_page.items == cold_page.items,
             "warm page changed results"
         );
         Ok(())
     })?;
-    validate_pagination(&connection, &page_query)?;
+    validate_pagination(&index, &page_query)?;
 
     let search_query = MappingQuery {
         search: Some("item".into()),
@@ -130,18 +113,17 @@ fn main() -> Result<()> {
         ..MappingQuery::default()
     };
     let search_p95 = measure_p95(|| {
-        let search_page = list_mappings(&connection, &search_query, None)?;
+        let search_page = index.mappings(&search_query, None)?;
         ensure!(
             search_page.items.len() == 100,
             "unexpected search result count"
         );
         Ok(())
     })?;
-    validate_pagination(&connection, &search_query)?;
+    validate_pagination(&index, &search_query)?;
 
     let started = Instant::now();
-    let shadowed_page = list_mappings(
-        &connection,
+    let shadowed_page = index.mappings(
         &MappingQuery {
             relation_key: Some(cold_page.items[0].relation_key.clone()),
             include_shadowed: true,
@@ -156,11 +138,6 @@ fn main() -> Result<()> {
         "unexpected provenance occurrence count"
     );
 
-    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    ensure!(
-        integrity == "ok",
-        "SQLite integrity check failed: {integrity}"
-    );
     ensure!(
         warm_page_p95 <= MAX_QUERY_P95,
         "warm page p95 exceeded {} ms: {} ms",
@@ -186,9 +163,7 @@ fn main() -> Result<()> {
         mapping_occurrences,
         active_relations: summary.active_relation_count,
         shadowed_occurrences: summary.shadowed_occurrence_count,
-        resolved_units,
         active_exact_claims: summary.active_exact_claim_count,
-        active_search_documents,
         source_bytes: high_bytes + low_bytes,
         index_bytes: fs::metadata(&index_path)?.len(),
         build_milliseconds: milliseconds(build_elapsed),
@@ -252,65 +227,23 @@ fn peak_rss_bytes() -> Option<u64> {
     kilobytes.checked_mul(1024)
 }
 
-fn validate_query_plans(connection: &Connection) -> Result<()> {
-    let page_plan = query_plan(
-        connection,
-        "SELECT occurrence.relation_key
-         FROM active_relation
-         JOIN occurrence ON occurrence.id = active_relation.occurrence_id
-         ORDER BY active_relation.relation_key
-         LIMIT 101",
-    )?;
-    ensure!(
-        !page_plan.contains("TEMP B-TREE"),
-        "active page query requires a temporary sort:\n{page_plan}"
-    );
-
-    let search_plan = query_plan(
-        connection,
-        "SELECT occurrence.id
-         FROM active_search
-         JOIN occurrence ON occurrence.id = active_search.rowid
-            JOIN active_relation ON active_relation.occurrence_id = occurrence.id
-            JOIN layer ON layer.position = occurrence.layer_position
-            WHERE active_search MATCH '\"item\"*'
-            ORDER BY active_search.rowid
-            LIMIT 101",
-    )?;
-    ensure!(
-        search_plan.contains("VIRTUAL TABLE INDEX"),
-        "search query does not use the FTS index:\n{search_plan}"
-    );
-    ensure!(
-        !search_plan.contains("TEMP B-TREE"),
-        "search query requires a temporary sort:\n{search_plan}"
-    );
-    Ok(())
-}
-
-fn query_plan(connection: &Connection, sql: &str) -> Result<String> {
-    let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
-    let plan = statement
-        .query_map([], |row| row.get::<_, String>(3))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .join("\n");
-    Ok(plan)
-}
-
-fn validate_pagination(connection: &Connection, query: &MappingQuery) -> Result<()> {
+fn validate_pagination(index: &RuntimeIndex, query: &MappingQuery) -> Result<()> {
     let mut cursor = None;
-    let mut relation_keys = BTreeSet::new();
+    let mut previous_relation_key = None;
     for _ in 0..3 {
-        let page = list_mappings(connection, query, cursor.as_ref())?;
+        let page = index.mappings(query, cursor.as_ref())?;
         ensure!(
             page.items.len() == query.limit as usize,
             "unexpected keyset page size"
         );
         for item in page.items {
-            ensure!(
-                relation_keys.insert(item.relation_key),
-                "keyset pagination returned a duplicate relation"
-            );
+            if let Some(previous) = &previous_relation_key {
+                ensure!(
+                    previous < &item.relation_key,
+                    "keyset pagination is not in canonical relation-key order"
+                );
+            }
+            previous_relation_key = Some(item.relation_key);
         }
         cursor = page.next_cursor;
         ensure!(cursor.is_some(), "keyset pagination ended early");

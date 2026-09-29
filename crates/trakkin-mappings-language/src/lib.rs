@@ -2,7 +2,7 @@ mod parser;
 mod validation;
 
 pub use parser::{LocatedRecord, SourceSpan, parse, visit_records};
-pub use validation::{Resolved, ResolvedExpression, Resolver, validate};
+pub use validation::{IdentityResolver, Resolved, ResolvedExpression, Resolver, validate};
 
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,7 @@ impl Selection {
         self.canonical_with_extent_divisor(1)
     }
 
-    pub fn resolution_key(&self) -> String {
+    pub fn selection_key(&self) -> String {
         let mut text = self.reference.clone();
         if let Some(selector) = &self.selector {
             text.push_str(" :: ");
@@ -63,13 +63,41 @@ impl Selection {
     }
 
     fn canonical_with_extent_divisor(&self, divisor: u64) -> String {
-        let mut text = self.resolution_key();
+        let mut text = self.selection_key();
         let extent = self.extent.get() / divisor;
         if extent != 1 {
             text.push_str(&format!(" @{extent}"));
         }
         text
     }
+}
+
+pub fn parse_selection_key(text: &str) -> Result<Selection> {
+    let mut records = parse(&format!(
+        "{text} <=> dev.trakkin.validation://mapping-endpoint"
+    ))?;
+    ensure!(
+        records.len() == 1,
+        "selection key must contain one selection"
+    );
+    let record = records.pop().unwrap();
+    let Expression::Selection(selection) = record.statement.left else {
+        bail!("selection key must be a selection");
+    };
+    ensure!(
+        selection.selection_key() == text,
+        "selection key must use canonical form without an extent"
+    );
+    Ok(selection)
+}
+
+pub fn parse_unit_key(text: &str) -> Result<Selection> {
+    let selection = parse_selection_key(text)?;
+    ensure!(
+        selection.selector.is_none(),
+        "unit key must identify one concrete source unit"
+    );
+    Ok(selection)
 }
 
 fn default_extent() -> NonZeroU64 {
@@ -274,6 +302,13 @@ pub fn identifier(text: &str) -> bool {
 fn bare_scalar(text: &str) -> bool {
     !text.is_empty()
         && text != "::"
+        && !text.strip_prefix('@').is_some_and(|digits| {
+            digits
+                .bytes()
+                .next()
+                .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
         && text.split('.').all(|segment| {
             !segment.is_empty()
                 && segment

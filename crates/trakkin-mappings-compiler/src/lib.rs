@@ -5,18 +5,19 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use trakkin_mappings_language::{
-    Expression, ID_VERSION, Operator, RELATION_KEY_VERSION, Resolved, ResolvedExpression, Resolver,
-    Selection, parse, validate, visit_records,
+    Expression, ID_VERSION, IdentityResolver, Operator, RELATION_KEY_VERSION, ResolvedExpression,
+    Resolver, parse, parse_unit_key, validate, visit_records,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
-pub const COMPILER_VERSION: &str = "trakkin:runtime-compiler:v1\0";
-pub const SELECTOR_POLICY_VERSION: &str = "trakkin:selector-policy:none:v1\0";
+pub const SCHEMA_VERSION: u32 = 2;
+pub const COMPILER_VERSION: &str = "trakkin:runtime-compiler:v2\0";
+pub const MAXIMUM_UNIT_RESOLUTION_BATCH_SIZE: usize = 1_000;
 
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
@@ -60,38 +61,52 @@ CREATE TABLE selection (
     expression_path TEXT NOT NULL,
     reference TEXT NOT NULL,
     source TEXT NOT NULL,
-    resolution_key TEXT NOT NULL,
+    selection_key TEXT NOT NULL,
     extent INTEGER NOT NULL,
     PRIMARY KEY(occurrence_id, side, ordinal)
 ) WITHOUT ROWID;
-CREATE TABLE resolved_unit (
+CREATE TABLE concrete_unit (
+    id INTEGER PRIMARY KEY,
+    unit_key TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL
+);
+CREATE TABLE relation_side (
+    occurrence_id INTEGER NOT NULL REFERENCES occurrence(id) ON DELETE CASCADE,
+    side INTEGER NOT NULL,
+    ordered INTEGER NOT NULL,
+    total_extent INTEGER NOT NULL,
+    PRIMARY KEY(occurrence_id, side)
+) WITHOUT ROWID;
+CREATE TABLE relation_member (
     occurrence_id INTEGER NOT NULL REFERENCES occurrence(id) ON DELETE CASCADE,
     side INTEGER NOT NULL,
     ordinal INTEGER NOT NULL,
-    unit TEXT NOT NULL,
-    source TEXT NOT NULL,
+    unit_id INTEGER NOT NULL REFERENCES concrete_unit(id),
     extent INTEGER NOT NULL,
     coordinate TEXT,
     PRIMARY KEY(occurrence_id, side, ordinal),
-    UNIQUE(occurrence_id, side, unit)
+    UNIQUE(occurrence_id, side, unit_id),
+    FOREIGN KEY(occurrence_id, side)
+        REFERENCES relation_side(occurrence_id, side) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE TABLE alignment_segment (
+    occurrence_id INTEGER NOT NULL REFERENCES occurrence(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    left_ordinal INTEGER NOT NULL,
+    right_ordinal INTEGER NOT NULL,
+    left_offset INTEGER NOT NULL,
+    right_offset INTEGER NOT NULL,
+    extent INTEGER NOT NULL,
+    PRIMARY KEY(occurrence_id, ordinal)
 ) WITHOUT ROWID;
 CREATE TABLE active_relation (
     relation_key TEXT PRIMARY KEY,
     occurrence_id INTEGER NOT NULL UNIQUE REFERENCES occurrence(id)
 ) WITHOUT ROWID;
-CREATE TABLE exclusive_source_pair (
-    origin_source TEXT NOT NULL,
-    target_source TEXT NOT NULL,
-    PRIMARY KEY(origin_source, target_source)
-) WITHOUT ROWID;
-CREATE TABLE active_exact_claim (
-    origin_source TEXT NOT NULL,
-    origin_unit TEXT NOT NULL,
-    target_source TEXT NOT NULL,
-    target_unit TEXT NOT NULL,
-    occurrence_id INTEGER NOT NULL REFERENCES occurrence(id),
-    PRIMARY KEY(origin_source, origin_unit, target_source, target_unit, occurrence_id)
-) WITHOUT ROWID;
+CREATE TABLE active_search_document (
+    position INTEGER PRIMARY KEY,
+    occurrence_id INTEGER NOT NULL UNIQUE REFERENCES occurrence(id)
+);
 CREATE VIRTUAL TABLE active_search USING fts5(
     statement,
     endpoints,
@@ -102,7 +117,7 @@ CREATE TABLE build_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) WITHOUT ROWID;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 ";
 
 const INDEXES: &str = "
@@ -114,10 +129,12 @@ CREATE INDEX occurrence_layer ON occurrence(layer_position, record_ordinal);
 CREATE INDEX occurrence_operator ON occurrence(operator, relation_key, statement_id);
 CREATE INDEX metadata_annotation ON metadata(annotation_name, annotation_value, occurrence_id);
 CREATE INDEX selection_reference ON selection(reference, occurrence_id, side, ordinal);
+CREATE INDEX selection_key_lookup ON selection(
+    selection_key, occurrence_id, side, ordinal
+);
 CREATE INDEX selection_source ON selection(source, occurrence_id, side, ordinal);
-CREATE INDEX resolved_unit_lookup ON resolved_unit(unit, occurrence_id, side, ordinal);
-CREATE INDEX active_exact_claim_policy ON active_exact_claim(
-    origin_source, target_source, origin_unit, target_unit, occurrence_id
+CREATE INDEX relation_member_unit_lookup ON relation_member(
+    unit_id, occurrence_id, side, ordinal
 );
 ";
 
@@ -191,6 +208,7 @@ impl ConflictPolicy {
 pub struct CompileOptions {
     pub max_record_bytes: usize,
     pub conflict_policy: ConflictPolicy,
+    pub resolver: Arc<dyn Resolver>,
 }
 
 impl Default for CompileOptions {
@@ -198,6 +216,7 @@ impl Default for CompileOptions {
         Self {
             max_record_bytes: 1024 * 1024,
             conflict_policy: ConflictPolicy::default(),
+            resolver: Arc::new(IdentityResolver),
         }
     }
 }
@@ -249,7 +268,7 @@ impl Default for MappingQuery {
 pub struct MappingCursor {
     pub chain_fingerprint: String,
     pub query_fingerprint: String,
-    pub search_rowid: Option<u64>,
+    pub search_position: Option<u64>,
     pub relation_key: String,
     pub layer_position: u64,
     pub statement_id: String,
@@ -278,6 +297,66 @@ pub struct MappingPage {
     pub chain_fingerprint: String,
     pub items: Vec<MappingRow>,
     pub next_cursor: Option<MappingCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MappingSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappingRelationMember {
+    pub unit_key: String,
+    pub ordinal: u64,
+    pub extent: u64,
+    pub coordinate: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappingRelationSide {
+    pub expression: Expression,
+    pub ordered: bool,
+    pub total_extent: u64,
+    pub members: Vec<MappingRelationMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappingAlignmentSegment {
+    pub left_ordinal: u64,
+    pub right_ordinal: u64,
+    pub left_offset: u64,
+    pub right_offset: u64,
+    pub extent: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappingUnitMatch {
+    pub relation_key: String,
+    pub statement_id: String,
+    pub operator: Operator,
+    pub matched_side: MappingSide,
+    pub member_ordinal: u64,
+    pub left: MappingRelationSide,
+    pub right: MappingRelationSide,
+    pub alignments: Vec<MappingAlignmentSegment>,
+    pub evidence_fingerprint: String,
+    pub source_key: String,
+    pub source_content_hash: String,
+    pub layer_position: u64,
+    pub record_ordinal: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappingUnitResolution {
+    pub unit_key: String,
+    pub matches: Vec<MappingUnitMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappingUnitResolutionBatch {
+    pub chain_fingerprint: String,
+    pub units: Vec<MappingUnitResolution>,
 }
 
 pub fn compile(
@@ -314,18 +393,63 @@ pub fn compile(
     result
 }
 
-pub fn open_read_only(path: &Path) -> Result<Connection> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    ensure!(
-        version == SCHEMA_VERSION,
-        "unsupported runtime index version; rebuild the derived index"
-    );
-    Ok(connection)
+pub struct RuntimeIndex {
+    connection: Connection,
+    chain_fingerprint: String,
 }
 
-pub fn list_mappings(
+impl RuntimeIndex {
+    pub fn open(path: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        ensure!(
+            version == SCHEMA_VERSION,
+            "unsupported runtime index version; rebuild the derived index"
+        );
+        let chain_fingerprint = connection
+            .query_row(
+                "SELECT value FROM build_metadata WHERE key = 'chain_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .context("runtime index has no chain fingerprint")?;
+        Ok(Self {
+            connection,
+            chain_fingerprint,
+        })
+    }
+
+    pub fn chain_fingerprint(&self) -> &str {
+        &self.chain_fingerprint
+    }
+
+    pub fn verify_integrity(&self) -> Result<()> {
+        let result: String = self
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        ensure!(
+            result == "ok",
+            "runtime index integrity check failed: {result}"
+        );
+        Ok(())
+    }
+
+    pub fn mappings(
+        &self,
+        query: &MappingQuery,
+        cursor: Option<&MappingCursor>,
+    ) -> Result<MappingPage> {
+        list_mappings(&self.connection, &self.chain_fingerprint, query, cursor)
+    }
+
+    pub fn resolve_units(&self, unit_keys: &[String]) -> Result<MappingUnitResolutionBatch> {
+        resolve_mapping_units(&self.connection, &self.chain_fingerprint, unit_keys)
+    }
+}
+
+fn list_mappings(
     connection: &Connection,
+    chain_fingerprint: &str,
     query: &MappingQuery,
     cursor: Option<&MappingCursor>,
 ) -> Result<MappingPage> {
@@ -334,13 +458,6 @@ pub fn list_mappings(
         "mapping query limit must be between 1 and 250"
     );
     let query = NormalizedQuery::new(query)?;
-    let chain_fingerprint: String = connection
-        .query_row(
-            "SELECT value FROM build_metadata WHERE key = 'chain_fingerprint'",
-            [],
-            |row| row.get(0),
-        )
-        .context("runtime index has no chain fingerprint")?;
     let query_fingerprint = query.fingerprint();
     if let Some(cursor) = cursor {
         ensure!(
@@ -352,7 +469,7 @@ pub fn list_mappings(
             "mapping cursor does not match the query filters"
         );
         ensure!(
-            cursor.search_rowid.is_some() == query.search.is_some(),
+            cursor.search_position.is_some() == query.search.is_some(),
             "mapping cursor search position does not match the query"
         );
     }
@@ -391,7 +508,9 @@ pub fn list_mappings(
     if query.search.is_some() {
         sql.push_str(
             "FROM active_search
-             JOIN occurrence ON occurrence.id = active_search.rowid
+                         JOIN active_search_document
+                             ON active_search_document.position = active_search.rowid
+                         JOIN occurrence ON occurrence.id = active_search_document.occurrence_id
              JOIN active_relation ON active_relation.occurrence_id = occurrence.id
              JOIN layer ON layer.position = occurrence.layer_position ",
         );
@@ -473,9 +592,9 @@ pub fn list_mappings(
         sql.push_str(") ");
     }
     if let Some(cursor) = cursor {
-        if let Some(search_rowid) = cursor.search_rowid {
+        if let Some(search_position) = cursor.search_position {
             sql.push_str("AND active_search.rowid > ? ");
-            parameters.push(SqlValue::Integer(i64::try_from(search_rowid)?));
+            parameters.push(SqlValue::Integer(i64::try_from(search_position)?));
         } else if query.include_shadowed {
             sql.push_str(
                 "AND (
@@ -521,9 +640,9 @@ pub fn list_mappings(
         let row = rows.last().expect("nonempty page has a final item");
         let item = &row.item;
         MappingCursor {
-            chain_fingerprint: chain_fingerprint.clone(),
+            chain_fingerprint: chain_fingerprint.to_owned(),
             query_fingerprint,
-            search_rowid: row.search_rowid,
+            search_position: row.search_position,
             relation_key: item.relation_key.clone(),
             layer_position: item.layer_position,
             statement_id: item.statement_id.clone(),
@@ -532,15 +651,313 @@ pub fn list_mappings(
     });
     let items = rows.into_iter().map(|row| row.item).collect();
     Ok(MappingPage {
-        chain_fingerprint,
+        chain_fingerprint: chain_fingerprint.to_owned(),
         items,
         next_cursor,
     })
 }
 
+fn resolve_mapping_units(
+    connection: &Connection,
+    chain_fingerprint: &str,
+    unit_keys: &[String],
+) -> Result<MappingUnitResolutionBatch> {
+    const QUERY_CHUNK_SIZE: usize = 250;
+
+    ensure!(
+        unit_keys.len() <= MAXIMUM_UNIT_RESOLUTION_BATCH_SIZE,
+        "mapping unit resolution batch exceeds {MAXIMUM_UNIT_RESOLUTION_BATCH_SIZE} keys"
+    );
+    let mut unit_positions = BTreeMap::new();
+    let mut units = Vec::new();
+    for unit_key in unit_keys {
+        ensure!(
+            unit_key.len() <= 4_096,
+            "mapping unit key exceeds 4096 bytes"
+        );
+        parse_unit_key(unit_key).context("mapping unit key is invalid")?;
+        if unit_positions.contains_key(unit_key) {
+            continue;
+        }
+        unit_positions.insert(unit_key.clone(), units.len());
+        units.push(MappingUnitResolution {
+            unit_key: unit_key.clone(),
+            matches: Vec::new(),
+        });
+    }
+
+    let unique_keys = units
+        .iter()
+        .map(|unit| unit.unit_key.clone())
+        .collect::<Vec<_>>();
+    let mut raw_matches = Vec::new();
+    for chunk in unique_keys.chunks(QUERY_CHUNK_SIZE) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT concrete_unit.unit_key,
+                    occurrence.id,
+                    occurrence.relation_key,
+                    occurrence.statement_id,
+                    occurrence.operator,
+                    relation_member.side,
+                    relation_member.ordinal,
+                    occurrence.evidence_fingerprint,
+                    layer.source_key,
+                    layer.content_hash,
+                    occurrence.layer_position,
+                    occurrence.record_ordinal
+             FROM concrete_unit
+             JOIN relation_member INDEXED BY relation_member_unit_lookup
+               ON relation_member.unit_id = concrete_unit.id
+             JOIN active_relation
+               ON active_relation.occurrence_id = relation_member.occurrence_id
+             JOIN occurrence ON occurrence.id = active_relation.occurrence_id
+             JOIN layer ON layer.position = occurrence.layer_position
+             WHERE concrete_unit.unit_key IN ({placeholders})
+             ORDER BY concrete_unit.unit_key,
+                      occurrence.relation_key,
+                      relation_member.side,
+                      relation_member.ordinal"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        raw_matches.extend(
+            statement
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok(RawMappingUnitMatch {
+                        unit_key: row.get(0)?,
+                        occurrence_id: row.get(1)?,
+                        relation_key: row.get(2)?,
+                        statement_id: row.get(3)?,
+                        operator: row.get(4)?,
+                        side: row.get(5)?,
+                        member_ordinal: row.get::<_, i64>(6)? as u64,
+                        evidence_fingerprint: row.get(7)?,
+                        source_key: row.get(8)?,
+                        source_content_hash: row.get(9)?,
+                        layer_position: row.get::<_, i64>(10)? as u64,
+                        record_ordinal: row.get::<_, i64>(11)? as u64,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+
+    let occurrence_ids = raw_matches
+        .iter()
+        .map(|matched| matched.occurrence_id)
+        .collect::<BTreeSet<_>>();
+    let relations = load_materialized_relations(connection, &occurrence_ids)?;
+    for row in raw_matches {
+        let unit_position = unit_positions[&row.unit_key];
+        let relation = relations
+            .get(&row.occurrence_id)
+            .context("runtime index is missing materialized relation members")?;
+        units[unit_position].matches.push(row.into_match(relation)?);
+    }
+
+    Ok(MappingUnitResolutionBatch {
+        chain_fingerprint: chain_fingerprint.to_owned(),
+        units,
+    })
+}
+
+struct RawMappingUnitMatch {
+    unit_key: String,
+    occurrence_id: i64,
+    relation_key: String,
+    statement_id: String,
+    operator: String,
+    side: i64,
+    member_ordinal: u64,
+    evidence_fingerprint: String,
+    source_key: String,
+    source_content_hash: String,
+    layer_position: u64,
+    record_ordinal: u64,
+}
+
+#[derive(Clone)]
+struct MaterializedRelation {
+    left: MappingRelationSide,
+    right: MappingRelationSide,
+    alignments: Vec<MappingAlignmentSegment>,
+}
+
+impl RawMappingUnitMatch {
+    fn into_match(self, relation: &MaterializedRelation) -> Result<MappingUnitMatch> {
+        let operator = match self.operator.as_str() {
+            "<=>" => Operator::Exact,
+            "<~>" => Operator::Coverage,
+            "=>" => Operator::Implication,
+            _ => anyhow::bail!("runtime index contains an invalid mapping operator"),
+        };
+        let matched_side = match self.side {
+            0 => MappingSide::Left,
+            1 => MappingSide::Right,
+            _ => anyhow::bail!("runtime index contains an invalid mapping side"),
+        };
+        Ok(MappingUnitMatch {
+            relation_key: self.relation_key,
+            statement_id: self.statement_id,
+            operator,
+            matched_side,
+            member_ordinal: self.member_ordinal,
+            left: relation.left.clone(),
+            right: relation.right.clone(),
+            alignments: relation.alignments.clone(),
+            evidence_fingerprint: self.evidence_fingerprint,
+            source_key: self.source_key,
+            source_content_hash: self.source_content_hash,
+            layer_position: self.layer_position,
+            record_ordinal: self.record_ordinal,
+        })
+    }
+}
+
+fn load_materialized_relations(
+    connection: &Connection,
+    occurrence_ids: &BTreeSet<i64>,
+) -> Result<BTreeMap<i64, MaterializedRelation>> {
+    const QUERY_CHUNK_SIZE: usize = 250;
+
+    let occurrence_ids = occurrence_ids.iter().copied().collect::<Vec<_>>();
+    let mut relations =
+        BTreeMap::<i64, (Option<MappingRelationSide>, Option<MappingRelationSide>)>::new();
+    for chunk in occurrence_ids.chunks(QUERY_CHUNK_SIZE) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT relation_side.occurrence_id, relation_side.side, relation_side.ordered,
+                    relation_side.total_extent, occurrence.left_json, occurrence.right_json
+             FROM relation_side
+             JOIN occurrence ON occurrence.id = relation_side.occurrence_id
+             WHERE relation_side.occurrence_id IN ({placeholders})
+             ORDER BY relation_side.occurrence_id, relation_side.side"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (occurrence_id, side, ordered, total_extent, left_json, right_json) = row?;
+            let (expression_json, target) = match side {
+                0 => (left_json, 0),
+                1 => (right_json, 1),
+                _ => anyhow::bail!("runtime index contains an invalid mapping side"),
+            };
+            let materialized = MappingRelationSide {
+                expression: serde_json::from_str(&expression_json)
+                    .context("runtime index contains an invalid mapping expression")?,
+                ordered,
+                total_extent,
+                members: Vec::new(),
+            };
+            let entry = relations.entry(occurrence_id).or_default();
+            if target == 0 {
+                entry.0 = Some(materialized);
+            } else {
+                entry.1 = Some(materialized);
+            }
+        }
+
+        let sql = format!(
+            "SELECT relation_member.occurrence_id, relation_member.side,
+                    relation_member.ordinal, concrete_unit.unit_key,
+                    relation_member.extent, relation_member.coordinate
+             FROM relation_member
+             JOIN concrete_unit ON concrete_unit.id = relation_member.unit_id
+             WHERE relation_member.occurrence_id IN ({placeholders})
+             ORDER BY relation_member.occurrence_id, relation_member.side,
+                      relation_member.ordinal"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                MappingRelationMember {
+                    ordinal: row.get::<_, i64>(2)? as u64,
+                    unit_key: row.get(3)?,
+                    extent: row.get::<_, i64>(4)? as u64,
+                    coordinate: row.get(5)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (occurrence_id, side, member) = row?;
+            let relation = relations
+                .get_mut(&occurrence_id)
+                .context("runtime index is missing a materialized relation side")?;
+            match side {
+                0 => relation.0.as_mut(),
+                1 => relation.1.as_mut(),
+                _ => anyhow::bail!("runtime index contains an invalid mapping side"),
+            }
+            .context("runtime index is missing a materialized relation side")?
+            .members
+            .push(member);
+        }
+    }
+
+    let mut alignments = BTreeMap::<i64, Vec<MappingAlignmentSegment>>::new();
+    for chunk in occurrence_ids.chunks(QUERY_CHUNK_SIZE) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT occurrence_id, left_ordinal, right_ordinal,
+                    left_offset, right_offset, extent
+             FROM alignment_segment
+             WHERE occurrence_id IN ({placeholders})
+             ORDER BY occurrence_id, ordinal"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                MappingAlignmentSegment {
+                    left_ordinal: row.get::<_, i64>(1)? as u64,
+                    right_ordinal: row.get::<_, i64>(2)? as u64,
+                    left_offset: row.get::<_, i64>(3)? as u64,
+                    right_offset: row.get::<_, i64>(4)? as u64,
+                    extent: row.get::<_, i64>(5)? as u64,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (occurrence_id, segment) = row?;
+            alignments.entry(occurrence_id).or_default().push(segment);
+        }
+    }
+
+    relations
+        .into_iter()
+        .map(|(occurrence_id, (left, right))| {
+            Ok((
+                occurrence_id,
+                MaterializedRelation {
+                    left: left.context("runtime index is missing its left relation side")?,
+                    right: right.context("runtime index is missing its right relation side")?,
+                    alignments: alignments.remove(&occurrence_id).unwrap_or_default(),
+                },
+            ))
+        })
+        .collect()
+}
+
 struct MappingResultRow {
     item: MappingRow,
-    search_rowid: Option<u64>,
+    search_position: Option<u64>,
 }
 
 fn mapping_result_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MappingResultRow> {
@@ -572,7 +989,7 @@ fn mapping_result_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MappingResult
                 metadata.lines().map(str::to_owned).collect()
             },
         },
-        search_rowid: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+        search_position: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
     })
 }
 
@@ -721,7 +1138,8 @@ fn compile_candidate(
     validate_layers(layers)?;
     options.conflict_policy.validate()?;
     let policy_fingerprint = options.conflict_policy.fingerprint();
-    let chain_fingerprint = chain_fingerprint(layers, &policy_fingerprint);
+    let resolver_fingerprint = options.resolver.evidence_fingerprint();
+    let chain_fingerprint = chain_fingerprint(layers, &policy_fingerprint, &resolver_fingerprint);
     let mut connection = Connection::open(destination)
         .with_context(|| format!("creating candidate index {}", destination.display()))?;
     connection.execute_batch(
@@ -738,7 +1156,6 @@ fn compile_candidate(
     let active_exact_claim_count: u64;
     {
         let transaction = connection.transaction()?;
-        insert_conflict_policy(&transaction, &options.conflict_policy)?;
         for (position, layer) in layers.iter().enumerate() {
             transaction
                 .prepare_cached(
@@ -757,18 +1174,15 @@ fn compile_candidate(
                 position as u64,
                 layer,
                 options.max_record_bytes,
+                options.resolver.as_ref(),
             )?;
             occurrence_count += counts.0;
             active_relation_count += counts.1;
         }
-        materialize_active_exact_claims(&transaction)?;
         materialize_active_search(&transaction)?;
         transaction.execute_batch(INDEXES)?;
-        check_active_conflicts(&transaction)?;
-        active_exact_claim_count =
-            transaction.query_row("SELECT count(*) FROM active_exact_claim", [], |row| {
-                row.get(0)
-            })?;
+        check_active_conflicts(&transaction, &options.conflict_policy)?;
+        active_exact_claim_count = count_active_exact_claims(&transaction)?;
         for (key, value) in [
             ("chain_fingerprint", chain_fingerprint.clone()),
             ("layer_count", layers.len().to_string()),
@@ -782,7 +1196,7 @@ fn compile_candidate(
                 "active_exact_claim_count",
                 active_exact_claim_count.to_string(),
             ),
-            ("selector_policy", SELECTOR_POLICY_VERSION.to_owned()),
+            ("resolution_evidence", resolver_fingerprint),
             ("conflict_policy", policy_fingerprint),
         ] {
             transaction
@@ -838,6 +1252,7 @@ fn compile_layer(
     position: u64,
     layer: &MappingLayer,
     max_record_bytes: usize,
+    resolver: &dyn Resolver,
 ) -> Result<(u64, u64)> {
     let file = File::open(&layer.path)
         .with_context(|| format!("opening mapping source {}", layer.path.display()))?;
@@ -846,7 +1261,7 @@ fn compile_layer(
     let mut occurrence_count = 0_u64;
     let mut active_relation_count = 0_u64;
     visit_records(&mut reader, max_record_bytes, |located| {
-        let active = insert_occurrence(transaction, position, layer, located)?;
+        let active = insert_occurrence(transaction, position, layer, located, resolver)?;
         occurrence_count += 1;
         active_relation_count += u64::from(active);
         Ok(())
@@ -866,9 +1281,10 @@ fn insert_occurrence(
     position: u64,
     layer: &MappingLayer,
     located: trakkin_mappings_language::LocatedRecord,
+    resolver: &dyn Resolver,
 ) -> Result<bool> {
     let statement = &located.record.statement;
-    let resolved = validate(statement, &BareReferenceResolver).with_context(|| {
+    let resolved = validate(statement, resolver).with_context(|| {
         format!(
             "validating source {} record {}",
             layer.source_key, located.ordinal
@@ -924,8 +1340,15 @@ fn insert_occurrence(
             &mut ordinal,
         )?;
     }
-    insert_resolved_units(transaction, occurrence_id, 0, &resolved.0)?;
-    insert_resolved_units(transaction, occurrence_id, 1, &resolved.1)?;
+    insert_relation_side(transaction, occurrence_id, 0, &resolved.0)?;
+    insert_relation_side(transaction, occurrence_id, 1, &resolved.1)?;
+    insert_alignment_segments(
+        transaction,
+        occurrence_id,
+        statement.operator,
+        &resolved.0,
+        &resolved.1,
+    )?;
     let inserted = transaction
         .prepare_cached(
             "INSERT OR IGNORE INTO active_relation(relation_key, occurrence_id) VALUES (?1, ?2)",
@@ -974,7 +1397,7 @@ fn insert_selections(
                 .prepare_cached(
                     "INSERT INTO selection(
                         occurrence_id, side, ordinal, expression_path, reference, source,
-                        resolution_key, extent
+                        selection_key, extent
                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 )?
                 .execute(params![
@@ -984,7 +1407,7 @@ fn insert_selections(
                     path,
                     selection.reference,
                     selection.source(),
-                    selection.resolution_key(),
+                    selection.selection_key(),
                     selection.extent.get(),
                 ])?;
             *ordinal += 1;
@@ -1005,33 +1428,51 @@ fn insert_selections(
     Ok(())
 }
 
-fn insert_resolved_units(
+fn insert_relation_side(
     transaction: &Transaction<'_>,
     occurrence_id: i64,
     side: u64,
     resolved: &ResolvedExpression,
 ) -> Result<()> {
-    for (ordinal, (unit, extent)) in resolved.items.iter().zip(&resolved.extents).enumerate() {
-        let source = unit
-            .split_once("://")
-            .map(|value| value.0)
-            .context("resolved unit is not source-qualified")?;
+    let total_extent = resolved.extents.iter().try_fold(0_u64, |total, extent| {
+        total
+            .checked_add(*extent)
+            .context("resolved relation side extent exceeds the supported integer range")
+    })?;
+    transaction
+        .prepare_cached(
+            "INSERT INTO relation_side(occurrence_id, side, ordered, total_extent)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![occurrence_id, side, resolved.ordered, total_extent])?;
+
+    for (ordinal, (unit_key, extent)) in resolved.units.iter().zip(&resolved.extents).enumerate() {
+        let unit = parse_unit_key(unit_key).context("resolver returned an invalid unit key")?;
         let coordinate = resolved
             .coordinates
             .as_ref()
             .and_then(|coordinates| coordinates.get(ordinal));
         transaction
             .prepare_cached(
-                "INSERT INTO resolved_unit(
-                    occurrence_id, side, ordinal, unit, source, extent, coordinate
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO concrete_unit(unit_key, source) VALUES (?1, ?2)",
+            )?
+            .execute(params![unit_key, unit.source()])?;
+        let unit_id: i64 = transaction.query_row(
+            "SELECT id FROM concrete_unit WHERE unit_key = ?1",
+            [unit_key],
+            |row| row.get(0),
+        )?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO relation_member(
+                    occurrence_id, side, ordinal, unit_id, extent, coordinate
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
             .execute(params![
                 occurrence_id,
                 side,
                 ordinal as u64,
-                unit,
-                source,
+                unit_id,
                 extent,
                 coordinate,
             ])?;
@@ -1039,52 +1480,82 @@ fn insert_resolved_units(
     Ok(())
 }
 
-fn insert_conflict_policy(transaction: &Transaction<'_>, policy: &ConflictPolicy) -> Result<()> {
-    for pair in &policy.exclusive_source_pairs {
+fn insert_alignment_segments(
+    transaction: &Transaction<'_>,
+    occurrence_id: i64,
+    operator: Operator,
+    left: &ResolvedExpression,
+    right: &ResolvedExpression,
+) -> Result<()> {
+    if operator == Operator::Coverage {
+        return Ok(());
+    }
+
+    let mut left_ordinal = 0_usize;
+    let mut right_ordinal = 0_usize;
+    let mut left_offset = 0_u64;
+    let mut right_offset = 0_u64;
+    let mut segment_ordinal = 0_u64;
+    while left_ordinal < left.extents.len() && right_ordinal < right.extents.len() {
+        let left_remaining = left.extents[left_ordinal] - left_offset;
+        let right_remaining = right.extents[right_ordinal] - right_offset;
+        let extent = left_remaining.min(right_remaining);
         transaction
             .prepare_cached(
-                "INSERT INTO exclusive_source_pair(origin_source, target_source)
-                 VALUES (?1, ?2)",
+                "INSERT INTO alignment_segment(
+                    occurrence_id, ordinal, left_ordinal, right_ordinal,
+                    left_offset, right_offset, extent
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
-            .execute(params![pair.origin_source, pair.target_source])?;
+            .execute(params![
+                occurrence_id,
+                segment_ordinal,
+                left_ordinal as u64,
+                right_ordinal as u64,
+                left_offset,
+                right_offset,
+                extent,
+            ])?;
+        segment_ordinal += 1;
+        left_offset += extent;
+        right_offset += extent;
+        if left_offset == left.extents[left_ordinal] {
+            left_ordinal += 1;
+            left_offset = 0;
+        }
+        if right_offset == right.extents[right_ordinal] {
+            right_ordinal += 1;
+            right_offset = 0;
+        }
     }
     Ok(())
 }
 
-fn materialize_active_exact_claims(transaction: &Transaction<'_>) -> Result<()> {
-    transaction.execute_batch(
-        "INSERT OR IGNORE INTO active_exact_claim(
-            origin_source, origin_unit, target_source, target_unit, occurrence_id
-         )
-         SELECT left_unit.source, left_unit.unit, right_unit.source, right_unit.unit, occurrence.id
+fn count_active_exact_claims(transaction: &Transaction<'_>) -> Result<u64> {
+    let pair_count: u64 = transaction.query_row(
+        "SELECT count(*)
          FROM active_relation
          JOIN occurrence ON occurrence.id = active_relation.occurrence_id
-         JOIN resolved_unit AS left_unit
-           ON left_unit.occurrence_id = occurrence.id AND left_unit.side = 0
-         JOIN resolved_unit AS right_unit
-           ON right_unit.occurrence_id = occurrence.id
-          AND right_unit.side = 1
-          AND right_unit.ordinal = left_unit.ordinal
-         WHERE occurrence.operator = '<=>'
-         UNION ALL
-         SELECT right_unit.source, right_unit.unit, left_unit.source, left_unit.unit, occurrence.id
-         FROM active_relation
-         JOIN occurrence ON occurrence.id = active_relation.occurrence_id
-         JOIN resolved_unit AS left_unit
-           ON left_unit.occurrence_id = occurrence.id AND left_unit.side = 0
-         JOIN resolved_unit AS right_unit
-           ON right_unit.occurrence_id = occurrence.id
-          AND right_unit.side = 1
-          AND right_unit.ordinal = left_unit.ordinal
-         WHERE occurrence.operator = '<=>';",
+         JOIN relation_member
+           ON relation_member.occurrence_id = occurrence.id
+          AND relation_member.side = 0
+         WHERE occurrence.operator = '<=>'",
+        [],
+        |row| row.get(0),
     )?;
-    Ok(())
+    pair_count
+        .checked_mul(2)
+        .context("active exact claim count exceeds the supported integer range")
 }
 
 fn materialize_active_search(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
-        "INSERT INTO active_search(rowid, statement, endpoints, annotations)
-         SELECT occurrence.id,
+        "INSERT INTO active_search_document(position, occurrence_id)
+         SELECT row_number() OVER (ORDER BY active_relation.relation_key), occurrence.id
+         FROM active_relation
+         JOIN occurrence ON occurrence.id = active_relation.occurrence_id;
+         INSERT INTO active_search(rowid, statement, endpoints, annotations)
+         SELECT active_search_document.position,
                 occurrence.statement,
                 coalesce((
                     SELECT group_concat(selection.reference, ' ')
@@ -1096,56 +1567,79 @@ fn materialize_active_search(transaction: &Transaction<'_>) -> Result<()> {
                     FROM metadata
                     WHERE metadata.occurrence_id = occurrence.id
                 ), '')
-         FROM active_relation
-         JOIN occurrence ON occurrence.id = active_relation.occurrence_id
-         ORDER BY active_relation.relation_key;",
+         FROM active_search_document
+         JOIN occurrence ON occurrence.id = active_search_document.occurrence_id
+         ORDER BY active_search_document.position;",
     )?;
     Ok(())
 }
 
-fn check_active_conflicts(transaction: &Transaction<'_>) -> Result<()> {
-    let conflict: Option<(String, String)> = transaction
-        .query_row(
-            "SELECT claim.origin_unit, claim.target_source
-                         FROM active_exact_claim AS claim INDEXED BY active_exact_claim_policy
-                         WHERE EXISTS (
-                                 SELECT 1
-                                 FROM exclusive_source_pair AS policy
-                                 WHERE policy.origin_source = claim.origin_source
-                                     AND policy.target_source = claim.target_source
-                         )
-                         AND EXISTS (
-                                 SELECT 1
-                                 FROM active_exact_claim AS other INDEXED BY active_exact_claim_policy
-                                 WHERE other.origin_source = claim.origin_source
-                                     AND other.target_source = claim.target_source
-                                     AND other.origin_unit = claim.origin_unit
-                                     AND other.target_unit <> claim.target_unit
-                         )
-                         ORDER BY claim.origin_source, claim.target_source, claim.origin_unit,
-                                            claim.target_unit
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    ensure!(
-        conflict.is_none(),
-        "exclusive exact mapping conflict for {} toward {}",
-        conflict.as_ref().map_or("", |value| value.0.as_str()),
-        conflict.as_ref().map_or("", |value| value.1.as_str())
-    );
+fn check_active_conflicts(transaction: &Transaction<'_>, policy: &ConflictPolicy) -> Result<()> {
+    for pair in &policy.exclusive_source_pairs {
+        let conflict: Option<String> = transaction
+            .query_row(
+                "WITH exact_claim(origin_source, origin_unit_key, target_source, target_unit_key) AS (
+                     SELECT left_unit.source, left_unit.unit_key,
+                            right_unit.source, right_unit.unit_key
+                     FROM active_relation
+                     JOIN occurrence ON occurrence.id = active_relation.occurrence_id
+                     JOIN relation_member AS left_member
+                       ON left_member.occurrence_id = occurrence.id AND left_member.side = 0
+                     JOIN concrete_unit AS left_unit ON left_unit.id = left_member.unit_id
+                     JOIN relation_member AS right_member
+                       ON right_member.occurrence_id = occurrence.id
+                      AND right_member.side = 1
+                      AND right_member.ordinal = left_member.ordinal
+                     JOIN concrete_unit AS right_unit ON right_unit.id = right_member.unit_id
+                     WHERE occurrence.operator = '<=>'
+                     UNION ALL
+                     SELECT right_unit.source, right_unit.unit_key,
+                            left_unit.source, left_unit.unit_key
+                     FROM active_relation
+                     JOIN occurrence ON occurrence.id = active_relation.occurrence_id
+                     JOIN relation_member AS left_member
+                       ON left_member.occurrence_id = occurrence.id AND left_member.side = 0
+                     JOIN concrete_unit AS left_unit ON left_unit.id = left_member.unit_id
+                     JOIN relation_member AS right_member
+                       ON right_member.occurrence_id = occurrence.id
+                      AND right_member.side = 1
+                      AND right_member.ordinal = left_member.ordinal
+                     JOIN concrete_unit AS right_unit ON right_unit.id = right_member.unit_id
+                     WHERE occurrence.operator = '<=>'
+                 )
+                 SELECT origin_unit_key
+                 FROM exact_claim
+                 WHERE origin_source = ?1 AND target_source = ?2
+                 GROUP BY origin_unit_key
+                 HAVING min(target_unit_key) <> max(target_unit_key)
+                 ORDER BY origin_unit_key
+                 LIMIT 1",
+                params![pair.origin_source, pair.target_source],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            conflict.is_none(),
+            "exclusive exact mapping conflict for {} toward {}",
+            conflict.as_deref().unwrap_or(""),
+            pair.target_source
+        );
+    }
     Ok(())
 }
 
-fn chain_fingerprint(layers: &[MappingLayer], policy_fingerprint: &str) -> String {
+fn chain_fingerprint(
+    layers: &[MappingLayer],
+    policy_fingerprint: &str,
+    resolver_fingerprint: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hash_part(&mut hasher, b"trakkin:runtime-chain:v1\0");
     hash_part(&mut hasher, COMPILER_VERSION.as_bytes());
     hash_part(&mut hasher, &SCHEMA_VERSION.to_be_bytes());
     hash_part(&mut hasher, ID_VERSION.as_bytes());
     hash_part(&mut hasher, RELATION_KEY_VERSION.as_bytes());
-    hash_part(&mut hasher, SELECTOR_POLICY_VERSION.as_bytes());
+    hash_part(&mut hasher, resolver_fingerprint.as_bytes());
     hash_part(&mut hasher, policy_fingerprint.as_bytes());
     for layer in layers {
         hash_part(&mut hasher, layer.source_key.as_bytes());
@@ -1163,8 +1657,9 @@ fn evidence_fingerprint(
     hash_part(&mut hasher, canonical_record.as_bytes());
     for (side, expression) in [&resolved.0, &resolved.1].into_iter().enumerate() {
         hash_part(&mut hasher, &(side as u64).to_be_bytes());
+        hash_part(&mut hasher, &[u8::from(expression.ordered)]);
         for (ordinal, (unit, extent)) in
-            expression.items.iter().zip(&expression.extents).enumerate()
+            expression.units.iter().zip(&expression.extents).enumerate()
         {
             hash_part(&mut hasher, &(ordinal as u64).to_be_bytes());
             hash_part(&mut hasher, unit.as_bytes());
@@ -1192,22 +1687,6 @@ fn source_namespace(text: &str) -> bool {
     let mut bytes = text.bytes();
     bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-struct BareReferenceResolver;
-
-impl Resolver for BareReferenceResolver {
-    fn resolve(&self, selection: &Selection) -> Result<Resolved> {
-        ensure!(
-            selection.selector.is_none(),
-            "selectors are unsupported until versioned adapter evidence is configured"
-        );
-        Ok(Resolved {
-            items: vec![selection.reference.clone()],
-            ordered: true,
-            coordinates: None,
-        })
-    }
 }
 
 struct HashingReader<R> {

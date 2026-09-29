@@ -19,3 +19,7 @@ trakkin-mappings-language.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[example]]
+name = "runtime-scale"
+path = "examples/scale.rs"

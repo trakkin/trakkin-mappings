@@ -129,7 +129,7 @@ fn shard_placement_and_order_are_deterministic() {
 fn offline_evidence_enforces_cardinality_and_dimensions() {
     let root = tempfile::tempdir().unwrap();
     let policy = root.path().join("adapters.json");
-    fs::write(&policy, r#"{"version":1,"sources":{"a":{"dimensions":["episode"],"selections":{"a://show :: episode=1..2":{"items":["a://episode/1","a://episode/2"],"ordered":true}}},"b":{"dimensions":[],"selections":{}}}}"#).unwrap();
+    fs::write(&policy, r#"{"version":1,"sources":{"a":{"dimensions":["episode"],"selections":{"a://show :: episode=1..2":{"units":["a://episode/1","a://episode/2"],"ordered":true}}},"b":{"dimensions":[],"selections":{}}}}"#).unwrap();
     let adapters = Adapters::load(&policy).unwrap();
     assert!(
         insert(
