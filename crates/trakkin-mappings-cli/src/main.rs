@@ -124,7 +124,7 @@ fn main() -> Result<()> {
             limit,
         } => println!(
             "{}",
-            serde_json::to_string_pretty(&trakkin_mappings_index::query(
+            serde_json::to_string_pretty(&corpus::index::query(
                 &cli.root.join(database),
                 &reference,
                 limit

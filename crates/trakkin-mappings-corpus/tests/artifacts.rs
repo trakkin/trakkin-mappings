@@ -51,7 +51,7 @@ fn incremental_matches_clean_after_insert_metadata_edit_and_delete() {
         2
     );
     let results =
-        trakkin_mappings_index::query(&database, "com.imdb://title/tt0133093", 10).unwrap();
+        trakkin_mappings_corpus::index::query(&database, "com.imdb://title/tt0133093", 10).unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].record.starts_with("#@note verified"));
     remove(
@@ -69,10 +69,14 @@ fn incremental_matches_clean_after_insert_metadata_edit_and_delete() {
     let clean = root.path().join("clean.sqlite");
     index(root.path(), &clean, &adapters).unwrap();
     assert_eq!(
-        trakkin_mappings_index::logical_hash(&trakkin_mappings_index::open(&database).unwrap())
-            .unwrap(),
-        trakkin_mappings_index::logical_hash(&trakkin_mappings_index::open(&clean).unwrap())
-            .unwrap()
+        trakkin_mappings_corpus::index::logical_hash(
+            &trakkin_mappings_corpus::index::open(&database).unwrap()
+        )
+        .unwrap(),
+        trakkin_mappings_corpus::index::logical_hash(
+            &trakkin_mappings_corpus::index::open(&clean).unwrap()
+        )
+        .unwrap()
     );
 }
 
@@ -129,8 +133,9 @@ fn releases_are_byte_reproducible_and_queryable() {
     )
     .unwrap();
     assert_eq!(
-        trakkin_mappings_index::query(&sqlite, "org.themoviedb://movie/603", 100).unwrap()[0]
-            .statement,
+        trakkin_mappings_corpus::index::query(&sqlite, "org.themoviedb://movie/603", 100).unwrap()
+            [0]
+        .statement,
         FIRST
     );
 }
@@ -163,7 +168,7 @@ fn repeated_bidirectional_claims_do_not_reject_valid_equivalences() {
         index(root.path(), &database, &adapters).unwrap().mappings,
         2
     );
-    let connection = trakkin_mappings_index::open(&database).unwrap();
+    let connection = trakkin_mappings_corpus::index::open(&database).unwrap();
     let claims: u64 = connection
         .query_row("SELECT count(*) FROM claim", [], |row| row.get(0))
         .unwrap();
@@ -177,7 +182,7 @@ fn corrupted_cache_cannot_be_published() {
     insert(root.path(), FIRST, &adapters, false).unwrap();
     let database = root.path().join(INDEX);
     index(root.path(), &database, &adapters).unwrap();
-    let connection = trakkin_mappings_index::open(&database).unwrap();
+    let connection = trakkin_mappings_corpus::index::open(&database).unwrap();
     connection
         .execute("UPDATE mapping SET record = 'corrupted'", [])
         .unwrap();
@@ -215,7 +220,7 @@ fn exclusivity_conflicts_roll_back_index_updates() {
             .contains("exclusive mapping conflict")
     );
     assert_eq!(
-        trakkin_mappings_index::query(&database, "com.imdb://title/tt0133093", 100)
+        trakkin_mappings_corpus::index::query(&database, "com.imdb://title/tt0133093", 100)
             .unwrap()
             .len(),
         1

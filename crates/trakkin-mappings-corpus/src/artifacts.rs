@@ -28,8 +28,8 @@ pub fn index(root: &Path, database: &Path, adapters: &Adapters) -> Result<IndexR
 }
 
 fn index_unlocked(root: &Path, database: &Path, adapters: &Adapters) -> Result<IndexReport> {
-    let mut connection = trakkin_mappings_index::open(database)?;
-    let previous = trakkin_mappings_index::shard_keys(&connection)?;
+    let mut connection = crate::index::open(database)?;
+    let previous = crate::index::shard_keys(&connection)?;
     let adapter_hash = trakkin_mappings_language::digest(&[
         b"trakkin:validation-cache:v1\0",
         adapters.fingerprint().as_bytes(),
@@ -41,8 +41,7 @@ fn index_unlocked(root: &Path, database: &Path, adapters: &Adapters) -> Result<I
         include_bytes!("../../trakkin-mappings-language/src/lib.rs"),
         include_bytes!("../../trakkin-mappings-language/src/parser.rs"),
         include_bytes!("../../trakkin-mappings-language/src/validation.rs"),
-        include_bytes!("../../trakkin-mappings-index/Cargo.toml"),
-        include_bytes!("../../trakkin-mappings-index/src/lib.rs"),
+        include_bytes!("index.rs"),
         include_bytes!("../Cargo.toml"),
         include_bytes!("adapters.rs"),
         include_bytes!("lib.rs"),
@@ -83,7 +82,7 @@ fn index_unlocked(root: &Path, database: &Path, adapters: &Adapters) -> Result<I
             let resolved = trakkin_mappings_language::validate(&record.statement, adapters)?;
             let left = record.statement.left.selections()[0].source();
             let right = record.statement.right.selections()[0].source();
-            trakkin_mappings_index::insert_record(
+            crate::index::insert_record(
                 &transaction,
                 path,
                 &record,
@@ -95,9 +94,9 @@ fn index_unlocked(root: &Path, database: &Path, adapters: &Adapters) -> Result<I
             )?;
         }
     }
-    trakkin_mappings_index::check_conflicts(&transaction)?;
+    crate::index::check_conflicts(&transaction)?;
     let mappings = transaction.query_row("SELECT count(*) FROM mapping", [], |row| row.get(0))?;
-    let warnings = trakkin_mappings_index::overlap_warnings(&transaction)?;
+    let warnings = crate::index::overlap_warnings(&transaction)?;
     transaction.commit()?;
     Ok(IndexReport {
         rebuilt_shards: changed.len(),
@@ -185,15 +184,15 @@ pub fn release(
     let _lock = lock(root)?;
     let database = root.join(INDEX);
     let report = index_unlocked(root, &database, adapters)?;
-    let cached = trakkin_mappings_index::open(&database)?;
-    let logical_hash = trakkin_mappings_index::logical_hash(&cached)?;
+    let cached = crate::index::open(&database)?;
+    let logical_hash = crate::index::logical_hash(&cached)?;
     drop(cached);
     let scratch = tempfile::tempdir()?;
     let clean_path = scratch.path().join("clean.sqlite");
     index_unlocked(root, &clean_path, adapters)?;
-    let clean = trakkin_mappings_index::open(&clean_path)?;
+    let clean = crate::index::open(&clean_path)?;
     ensure!(
-        logical_hash == trakkin_mappings_index::logical_hash(&clean)?,
+        logical_hash == crate::index::logical_hash(&clean)?,
         "incremental index differs from clean build; discard the derived cache and investigate"
     );
     let parent = output
@@ -203,7 +202,7 @@ pub fn release(
     fs::create_dir_all(parent)?;
     let stage = tempfile::tempdir_in(parent)?;
     let sqlite = stage.path().join("trakkin-v1.sqlite");
-    trakkin_mappings_index::snapshot(&clean_path, &sqlite, commit, dirty, &adapters.fingerprint())?;
+    crate::index::snapshot(&clean_path, &sqlite, commit, dirty, &adapters.fingerprint())?;
     let sqlite_compressed = stage.path().join("trakkin-v1.sqlite.zst");
     let mut compressed = zstd::stream::write::Encoder::new(File::create(&sqlite_compressed)?, 9)?;
     io::copy(&mut File::open(&sqlite)?, &mut compressed)?;

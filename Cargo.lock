@@ -784,7 +784,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "trakkin-mappings-corpus",
- "trakkin-mappings-index",
  "trakkin-mappings-language",
 ]
 
@@ -812,21 +811,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "trakkin-mappings-index",
  "trakkin-mappings-language",
  "zstd",
-]
-
-[[package]]
-name = "trakkin-mappings-index"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "trakkin-mappings-language",
 ]
 
 [[package]]

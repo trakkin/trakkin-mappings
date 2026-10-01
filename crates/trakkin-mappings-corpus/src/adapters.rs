@@ -22,9 +22,11 @@ pub struct Source {
 
 impl Adapters {
     pub fn load(path: &Path) -> Result<Self> {
-        let adapters: Self = serde_json::from_slice(
-            &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
-        )?;
+        Self::from_slice(&fs::read(path).with_context(|| format!("reading {}", path.display()))?)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let adapters: Self = serde_json::from_slice(bytes)?;
         ensure!(
             adapters.version == 1,
             "unsupported adapter evidence version"
@@ -58,6 +60,10 @@ impl Adapters {
             }
         }
         Ok(adapters)
+    }
+
+    pub fn contains_source(&self, namespace: &str) -> bool {
+        self.sources.contains_key(namespace)
     }
 
     pub fn fingerprint(&self) -> String {

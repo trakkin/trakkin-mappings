@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod artifacts;
+pub mod index;
 
 use adapters::Adapters;
 use anyhow::{Context, Result, bail, ensure};
