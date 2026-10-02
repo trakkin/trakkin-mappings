@@ -1,0 +1,53 @@
+[workspace]
+members = [
+  "crates/trakkin-mappings-language",
+]
+resolver = "3"
+
+[workspace.package]
+authors = ["Elias Benbourenane"]
+edition = "2024"
+homepage = "https://trakkin.dev"
+license = "AGPL-3.0-only"
+publish = false
+repository = "https://github.com/trakkin/trakkin-mappings"
+rust-version = "1.97.1"
+version = "0.0.0"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+antlr-rust-codegen = "=0.29.0"
+antlr-rust-runtime = "=0.29.0"
+clap = { version = "4.6.7", features = ["derive"] }
+chrono = { version = "0.4.45", default-features = false, features = [
+  "clock",
+  "std",
+] }
+flate2 = "1.1.10"
+httpdate = "1.0.3"
+indicatif = "0.18.6"
+native-tls = "0.2.14"
+postgres = { version = "0.19.12", features = ["with-serde_json-1"] }
+postgres-native-tls = "0.5.2"
+postgresql_archive = { version = "0.21.0", default-features = false, features = ["blocking", "tls-rustls-ring", "theseus", "zonky"] }
+postgresql_embedded = { version = "0.21.0", default-features = false, features = ["blocking", "tls-rustls-ring", "zonky"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+  "blocking",
+  "json",
+  "query",
+  "rustls",
+] }
+fs2 = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+strsim = "0.11.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+url = "2.5.8"
+unicode-normalization = "0.1.25"
+trakkin-mappings-corpus = { path = "crates/trakkin-mappings-corpus" }
+trakkin-mappings-language = { path = "crates/trakkin-mappings-language" }
+trakkin-mappings-source = { path = "crates/trakkin-mappings-source" }
+trakkin-mappings-test-support = { path = "crates/trakkin-mappings-test-support" }

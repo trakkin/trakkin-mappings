@@ -1,11 +1,14 @@
 # ANTLR
 .antlr/
 
+# Build
+dist/
+
 # Cache
 .cache/
 
-# Build
-dist/
+# Environment
+*.env
 
 ######################################################################################################
 # https://github.com/github/gitignore/blob/ccf8d89c54f13410f797cb08ac1f39f674d8106e/Rust.gitignore   #
