@@ -29,6 +29,45 @@ fn canonicalization_and_identity() {
 }
 
 #[test]
+fn validates_constructed_references_before_calling_resolvers() {
+    #[derive(Debug)]
+    struct UnreachableResolver;
+    impl Resolver for UnreachableResolver {
+        fn evidence_fingerprint(&self) -> String {
+            "test".into()
+        }
+
+        fn validate_selection(&self, _: &Selection) -> anyhow::Result<()> {
+            panic!("invalid references must not reach the resolver")
+        }
+
+        fn resolve(&self, _: &Selection) -> anyhow::Result<Resolved> {
+            panic!("invalid references must not reach the resolver")
+        }
+    }
+    for reference in [
+        "missing-source",
+        "://empty",
+        "a://",
+        "a://x :: episode=1",
+        "a://x @2",
+    ] {
+        let mut record = parse("a://x <=> b://y").unwrap().remove(0);
+        let trakkin_mappings_language::Expression::Selection(selection) =
+            &mut record.statement.left
+        else {
+            unreachable!()
+        };
+        selection.reference = reference.into();
+        let error = validate(&record.statement, &UnreachableResolver).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid selection reference"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
 fn parses_canonical_selection_and_unit_keys() {
     let key = "com.thetvdb://series/123 :: episode=2,order=aired,season=1";
     assert_eq!(parse_selection_key(key).unwrap().selection_key(), key);

@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -65,6 +65,40 @@ pub fn insert_record(
     resolved: &(ResolvedExpression, ResolvedExpression),
     exclusive: (bool, bool),
 ) -> Result<()> {
+    for expression in [&record.statement.left, &record.statement.right] {
+        let selections = expression.selections();
+        ensure!(
+            !selections.is_empty(),
+            "mapping expression must contain a selection"
+        );
+        for selection in selections {
+            let (source, identity) = selection
+                .reference
+                .split_once("://")
+                .context("mapping reference must contain a source and identity")?;
+            ensure!(
+                !source.is_empty() && !identity.is_empty(),
+                "mapping reference must contain a source and identity"
+            );
+        }
+    }
+    if record.statement.operator == trakkin_mappings_language::Operator::Exact {
+        ensure!(
+            resolved.0.units.len() == resolved.1.units.len(),
+            "exact mapping has unequal cardinality"
+        );
+    }
+    let annotations = record
+        .metadata
+        .iter()
+        .map(|annotation| {
+            annotation
+                .strip_prefix("#@")
+                .context("corpus metadata must be an annotation")?
+                .split_once(' ')
+                .context("annotation must contain a name and value")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let statement = &record.statement;
     let id = statement.id();
     connection.execute(
@@ -80,12 +114,7 @@ pub fn insert_record(
             serde_json::to_string(&statement.right)?
         ],
     )?;
-    for (ordinal, annotation) in record.metadata.iter().enumerate() {
-        let (name, value) = annotation
-            .strip_prefix("#@")
-            .unwrap()
-            .split_once(' ')
-            .unwrap();
+    for (ordinal, (name, value)) in annotations.into_iter().enumerate() {
         connection.execute(
             "INSERT INTO annotation VALUES (?1,?2,?3,?4)",
             params![id, ordinal as u64, name, value],
@@ -169,8 +198,11 @@ pub fn snapshot(
     dirty: bool,
     adapters: &str,
 ) -> Result<()> {
+    let source = source
+        .to_str()
+        .context("snapshot source path must be UTF-8")?;
     let connection = open(destination)?;
-    connection.execute("ATTACH DATABASE ?1 AS cached", [source.to_str().unwrap()])?;
+    connection.execute("ATTACH DATABASE ?1 AS cached", [source])?;
     connection.execute_batch("BEGIN;
         INSERT INTO shard SELECT * FROM cached.shard ORDER BY path;
         INSERT INTO mapping SELECT * FROM cached.mapping ORDER BY id;

@@ -27,6 +27,7 @@ pub trait Resolver: Debug + Send + Sync {
     fn validate_selection(&self, _selection: &Selection) -> Result<()> {
         Ok(())
     }
+
     fn resolve(&self, selection: &Selection) -> Result<Resolved>;
 }
 
@@ -140,6 +141,7 @@ fn resolve_expression(
 ) -> Result<ResolvedExpression> {
     match expression {
         Expression::Selection(selection) => {
+            parse_unit_key(&selection.reference).context("invalid selection reference")?;
             resolver.validate_selection(selection)?;
             let result = if selection.selector.is_none() {
                 Resolved {

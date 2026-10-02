@@ -80,6 +80,88 @@ fn incremental_matches_clean_after_insert_metadata_edit_and_delete() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn snapshot_rejects_unrepresentable_source_paths_without_creating_output() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+    let destination = root.path().join("snapshot.sqlite");
+    let error =
+        trakkin_mappings_corpus::index::snapshot(&source, &destination, "test", false, "test")
+            .unwrap_err();
+    assert!(error.to_string().contains("source path must be UTF-8"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn index_returns_errors_for_constructed_invalid_annotations() {
+    let root = tempfile::tempdir().unwrap();
+    let connection =
+        trakkin_mappings_corpus::index::open(&root.path().join("index.sqlite")).unwrap();
+    let adapters = adapters();
+    for metadata in ["# ordinary comment", "#@missing-value"] {
+        let mut record = single_record(FIRST).unwrap();
+        record.metadata.push(metadata.into());
+        let resolved = trakkin_mappings_language::validate(&record.statement, &adapters).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        transaction
+            .execute("INSERT INTO shard VALUES ('test', 'hash', 'adapter')", [])
+            .unwrap();
+        let error = trakkin_mappings_corpus::index::insert_record(
+            &transaction,
+            "test",
+            &record,
+            &resolved,
+            (false, false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("annotation"));
+        let mappings: u64 = transaction
+            .query_row("SELECT count(*) FROM mapping", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mappings, 0);
+    }
+}
+
+#[test]
+fn index_rejects_invalid_references_and_cardinality_before_insertion() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for invalid_reference in [
+        Some("invalid"),
+        Some("://identity"),
+        Some("source://"),
+        None,
+    ] {
+        let mut record = single_record(FIRST).unwrap();
+        let mut resolved =
+            trakkin_mappings_language::validate(&record.statement, &adapters()).unwrap();
+        if let Some(reference) = invalid_reference {
+            let trakkin_mappings_language::Expression::Selection(selection) =
+                &mut record.statement.left
+            else {
+                unreachable!();
+            };
+            selection.reference = reference.into();
+        } else {
+            resolved.1.units.clear();
+        }
+        let error = trakkin_mappings_corpus::index::insert_record(
+            &connection,
+            "test",
+            &record,
+            &resolved,
+            (false, false),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("reference") || message.contains("cardinality"),
+            "{message}"
+        );
+    }
+}
+
 #[test]
 fn releases_are_byte_reproducible_and_queryable() {
     let root = tempfile::tempdir().unwrap();
