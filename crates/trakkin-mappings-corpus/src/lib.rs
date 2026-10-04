@@ -166,7 +166,7 @@ pub fn read_shard(root: &Path, relative: &Path, adapters: &Adapters) -> Result<V
     }
     ensure!(
         canonical == text,
-        "noncanonical shard {}; use trakkin-mappings fmt to inspect canonical input, then reinsert",
+        "noncanonical shard {}; use trakkin-mappings corpus fmt to inspect canonical input, then reinsert",
         relative.display()
     );
     Ok(records)

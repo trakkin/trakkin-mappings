@@ -20,6 +20,7 @@ clap.workspace = true
 serde_json.workspace = true
 trakkin-mappings-corpus.workspace = true
 trakkin-mappings-language.workspace = true
+trakkin-mappings-ingestion.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
