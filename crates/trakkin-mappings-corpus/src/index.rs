@@ -188,7 +188,7 @@ pub fn logical_hash(connection: &Connection) -> Result<String> {
             }
         }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(trakkin_mappings_language::hex_digest(&hasher.finalize()))
 }
 
 pub fn snapshot(

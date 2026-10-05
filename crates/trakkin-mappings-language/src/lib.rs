@@ -288,7 +288,20 @@ pub fn digest(parts: &[&[u8]]) -> String {
     for part in parts {
         hasher.update(part);
     }
-    format!("{:x}", hasher.finalize())
+    hex_digest(&hasher.finalize())
+}
+
+pub fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 15) as usize] as char,
+            ]
+        })
+        .collect()
 }
 
 pub fn identifier(text: &str) -> bool {

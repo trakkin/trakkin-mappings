@@ -184,7 +184,7 @@ impl ConflictPolicy {
             hash_part(&mut hasher, pair.origin_source.as_bytes());
             hash_part(&mut hasher, pair.target_source.as_bytes());
         }
-        format!("{:x}", hasher.finalize())
+        trakkin_mappings_language::hex_digest(&hasher.finalize())
     }
 
     fn validate(&self) -> Result<()> {
@@ -1105,7 +1105,7 @@ impl NormalizedQuery {
         hash_optional(&mut hasher, self.annotation_name.as_deref());
         hash_optional(&mut hasher, self.annotation_value.as_deref());
         hash_part(&mut hasher, &[u8::from(self.include_shadowed)]);
-        format!("{:x}", hasher.finalize())
+        trakkin_mappings_language::hex_digest(&hasher.finalize())
     }
 }
 
@@ -1645,7 +1645,7 @@ fn chain_fingerprint(
         hash_part(&mut hasher, layer.source_key.as_bytes());
         hash_part(&mut hasher, layer.content_hash.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    trakkin_mappings_language::hex_digest(&hasher.finalize())
 }
 
 fn evidence_fingerprint(
@@ -1675,7 +1675,7 @@ fn evidence_fingerprint(
             }
         }
     }
-    format!("{:x}", hasher.finalize())
+    trakkin_mappings_language::hex_digest(&hasher.finalize())
 }
 
 fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -1703,7 +1703,7 @@ impl<R> HashingReader<R> {
     }
 
     fn finish(self) -> String {
-        format!("{:x}", self.hasher.finalize())
+        trakkin_mappings_language::hex_digest(&self.hasher.finalize())
     }
 }
 

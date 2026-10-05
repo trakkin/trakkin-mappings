@@ -198,7 +198,10 @@ fn write_layer(path: &Path, count: u64, reversed: bool) -> Result<(String, u64)>
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
-    Ok((format!("{:x}", hasher.finalize()), bytes))
+    Ok((
+        trakkin_mappings_language::hex_digest(&hasher.finalize()),
+        bytes,
+    ))
 }
 
 fn benchmark_tempdir() -> Result<TempDir> {

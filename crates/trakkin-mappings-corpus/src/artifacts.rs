@@ -118,7 +118,7 @@ fn hash_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(trakkin_mappings_language::hex_digest(&hasher.finalize()))
 }
 
 #[derive(Debug, Serialize)]
