@@ -23,9 +23,7 @@ fn exposes_corpus_namespace() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("corpus"));
-    assert!(!help.contains("--root"));
-    assert!(output.status.success());
-    assert!(help.contains("check"));
+    assert!(help.contains("ingestion"));
     assert!(!help.contains("--root"));
     for command in [
         "fmt", "locate", "insert", "remove", "validate", "index", "query", "release", "stats",

@@ -102,15 +102,22 @@ impl Resolver for Adapters {
             "com.imdb" => opaque.strip_prefix("title/tt").is_some_and(|value| {
                 value.len() >= 7 && value.bytes().all(|byte| byte.is_ascii_digit())
             }),
-            "org.themoviedb" => ["movie/", "tv/"]
-                .iter()
-                .any(|prefix| opaque.strip_prefix(prefix).is_some_and(positive_integer)),
-            "com.thetvdb" => ["series/", "movies/", "episodes/"]
-                .iter()
-                .any(|prefix| opaque.strip_prefix(prefix).is_some_and(positive_integer)),
-            "co.anilist" | "net.myanimelist" | "net.anidb" => {
-                opaque.strip_prefix("anime/").is_some_and(positive_integer)
+            "org.themoviedb" => {
+                ["movie/", "tv/", "season/", "episode/"]
+                    .iter()
+                    .any(|prefix| opaque.strip_prefix(prefix).is_some_and(positive_integer))
+                    || opaque.strip_prefix("episode_group/").is_some_and(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    })
             }
+            "com.thetvdb" => ["series/", "movie/", "season/", "episode/"]
+                .iter()
+                .any(|prefix| opaque.strip_prefix(prefix).is_some_and(positive_integer)),
+            "co.anilist" => opaque.strip_prefix("media/").is_some_and(positive_integer),
+            "net.myanimelist" => ["anime/", "manga/"]
+                .iter()
+                .any(|prefix| opaque.strip_prefix(prefix).is_some_and(positive_integer)),
+            "net.anidb" => opaque.strip_prefix("anime/").is_some_and(positive_integer),
             _ => !opaque.is_empty(),
         };
         ensure!(valid, "adapter rejects reference {}", selection.reference);

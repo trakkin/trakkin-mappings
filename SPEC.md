@@ -68,7 +68,7 @@ Examples:
 com.thetvdb://series/123
 org.themoviedb://tv/456
 com.imdb://title/tt1234567
-co.anilist://anime/5081
+co.anilist://media/5081
 net.myanimelist://anime/5114
 net.anidb://anime/6107
 ```
@@ -169,7 +169,7 @@ An expression is either a selection or an ordered composite.
 Order is significant. Selections may appear inside composites:
 
 ```text
-[co.anilist://anime/100 :: episode=1..12,co.anilist://anime/101 :: episode=1..12]
+[co.anilist://media/100 :: episode=1..12,co.anilist://media/101 :: episode=1..12]
 ```
 
 ### 5.1 Relative extent
@@ -266,7 +266,7 @@ An implementation MUST reject ambiguous positional correspondence instead of inf
 Each logical side of a mapping SHOULD contain exactly one source namespace.
 
 ```text
-com.thetvdb://series/123 :: order=aired,season=2 <~> [co.anilist://anime/100,co.anilist://anime/101]
+com.thetvdb://series/123 :: order=aired,season=2 <~> [co.anilist://media/100,co.anilist://media/101]
 ```
 
 Relationships that involve more than two source namespaces SHOULD be written as separate pairwise mappings.
@@ -425,7 +425,7 @@ a.example://show/1 :: season=1,episode=13..24 <=> b.example://show/2 :: season=2
 ### Cour split across top-level entities
 
 ```text
-com.thetvdb://series/123 :: episode=1..12,order=aired,season=2 <~> [co.anilist://anime/100 @6,co.anilist://anime/101 @6]
+com.thetvdb://series/123 :: episode=1..12,order=aired,season=2 <~> [co.anilist://media/100 @6,co.anilist://media/101 @6]
 ```
 
 ## 14. Core invariants

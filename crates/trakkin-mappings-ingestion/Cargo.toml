@@ -1,29 +1,21 @@
 [package]
+name = "trakkin-mappings-ingestion"
 authors.workspace = true
-autobins = false
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
-name = "trakkin-mappings-cli"
 publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "trakkin-mappings"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
 chrono.workspace = true
-fs2.workspace = true
-indicatif.workspace = true
+flate2.workspace = true
+httpdate.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-trakkin-mappings-corpus.workspace = true
-trakkin-mappings-language.workspace = true
-trakkin-mappings-ingestion.workspace = true
-
-[dev-dependencies]
+sha2.workspace = true
 tempfile.workspace = true

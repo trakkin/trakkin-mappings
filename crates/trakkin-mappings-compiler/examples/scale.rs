@@ -205,7 +205,7 @@ fn write_layer(path: &Path, count: u64, reversed: bool) -> Result<(String, u64)>
 }
 
 fn benchmark_tempdir() -> Result<TempDir> {
-    let root = std::env::var_os("TRAKKIN_SCALE_TMPDIR")
+    let root = std::env::var_os("TRAKKIN_MAPPINGS_SCALE_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))

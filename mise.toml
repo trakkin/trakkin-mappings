@@ -7,6 +7,8 @@ minimum_release_age = "3d"
 "npm:actions-up" = "1.18.0"
 node = "26.7.0"
 rust = "1.97.1"
+java = "temurin-21.0.12+101.0.LTS"
+maven = "3.10.0"
 
 [tasks.fix]
 description = "Fix CLI issues"
@@ -51,6 +53,15 @@ run = [{ task = "cli:test" }]
 [tasks."cli:test"]
 description = "Run CLI tests"
 run = "cargo test --workspace --all-features"
+
+[tasks."ingestion:build"]
+description = "Package the Paimon storage boundary"
+run = "mvn --batch-mode -q -f crates/trakkin-mappings-ingestion/paimon/pom.xml package"
+
+[tasks."ingestion:test"]
+description = "Test Rust acquisition and the real Paimon boundary"
+depends = ["ingestion:build"]
+run = "cargo test --locked -p trakkin-mappings-ingestion -- --include-ignored"
 
 [tasks.update]
 description = "Update the toolchain, workflows, and CLI dependencies"

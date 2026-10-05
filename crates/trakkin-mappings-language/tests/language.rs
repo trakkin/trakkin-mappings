@@ -73,10 +73,10 @@ fn parses_canonical_selection_and_unit_keys() {
     assert_eq!(parse_selection_key(key).unwrap().selection_key(), key);
     assert!(parse_unit_key(key).is_err());
     assert_eq!(
-        parse_unit_key("com.thetvdb://episodes/456")
+        parse_unit_key("com.thetvdb://episode/456")
             .unwrap()
             .reference,
-        "com.thetvdb://episodes/456"
+        "com.thetvdb://episode/456"
     );
 
     for invalid in [

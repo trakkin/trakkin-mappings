@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod corpus;
+mod ingestion;
 #[derive(Parser)]
 #[command(
     version,
@@ -16,12 +17,14 @@ struct Cli {
 enum Operation {
     /// Maintain the canonical Trakkin mapping corpus.
     Corpus(corpus::Command),
+    /// Acquire and maintain source-native provider mirrors.
+    Ingestion(ingestion::Command),
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Operation::Corpus(command) => command.run(),
+        Operation::Ingestion(command) => command.run(),
     }
 }

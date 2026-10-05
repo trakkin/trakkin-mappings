@@ -80,15 +80,18 @@ fn invalid_batches_never_write_and_reverse_duplicates_fail() {
 }
 
 #[test]
-fn anime_source_reference_shapes_are_validated() {
+fn anime_and_manga_source_reference_shapes_are_validated() {
     let root = tempfile::tempdir().unwrap();
     let adapters = adapters();
     let mapping = "net.myanimelist://anime/5114 <=> net.anidb://anime/6107";
     assert_eq!(insert(root.path(), mapping, &adapters, false).unwrap(), 1);
+    let manga = "net.myanimelist://manga/2 <=> co.anilist://media/30002";
+    assert_eq!(insert(root.path(), manga, &adapters, false).unwrap(), 1);
 
     for invalid in [
         "net.myanimelist://anime/0 <=> net.anidb://anime/6107",
-        "net.myanimelist://manga/5114 <=> net.anidb://anime/6107",
+        "net.myanimelist://manga/0 <=> co.anilist://media/30002",
+        "net.myanimelist://media/2 <=> co.anilist://media/30002",
         "net.myanimelist://anime/5114 <=> net.anidb://anime/06107",
     ] {
         assert!(insert(root.path(), invalid, &adapters, false).is_err());
