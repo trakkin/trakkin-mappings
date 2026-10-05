@@ -1,0 +1,27 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "trakkin-mappings-source"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+httpdate.workspace = true
+native-tls.workspace = true
+postgres.workspace = true
+postgres-native-tls.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+trakkin-mappings-test-support.workspace = true

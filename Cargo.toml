@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/trakkin-mappings-language",
+  "crates/trakkin-mappings-source",
+  "crates/trakkin-mappings-test-support",
 ]
 resolver = "3"
 
