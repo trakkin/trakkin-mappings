@@ -5,15 +5,17 @@ use serde_json::{Value, json};
 use trakkin_mappings_ingestion::{Change, Provider, providers::Tvdb};
 
 #[test]
-fn series_snapshot_preserves_independent_paginated_orders() {
+fn series_snapshot_preserves_parents_and_unaffected_paginated_orders() {
     use std::{net::TcpListener, thread};
     let episode = |number, absolute| json!({"id":12,"seriesId":1,"seasonNumber":1,"number":number,"absoluteNumber":absolute});
+    let series = json!({"id":1,"name":"Fixture series","defaultSeasonType":1,"seasonTypes":[{"id":1,"type":"official"},{"id":3,"type":"absolute"}],"seasons":[{"id":20,"seriesId":1,"number":1}]});
+    let expected_series = series.clone();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let handle = thread::spawn(move || {
         for response in [
             json!({"data":{"token":"fixture"}}),
-            json!({"status":"success","data":{"id":1,"defaultSeasonType":1,"seasonTypes":[{"id":1,"type":"official"},{"id":2,"type":"absolute"}]}}),
+            json!({"status":"success","data":series}),
         ] {
             let (mut stream, _) = listener.accept().unwrap();
             common::read_request(&mut stream);
@@ -28,7 +30,12 @@ fn series_snapshot_preserves_independent_paginated_orders() {
             } else {
                 json!("?page=1")
             };
-            let payload = json!({"status":"success","data":{"series":{"id":1},"episodes":[episode(if absolute {7} else {2},7)]},"links":{"next":next}});
+            let episodes = if absolute {
+                json!([episode(7,7),episode(8,7),{"id":14,"seriesId":1,"seasonNumber":1,"number":9,"absoluteNumber":9}])
+            } else {
+                json!([episode(2,7)])
+            };
+            let payload = json!({"status":"success","data":{"series":{"id":1},"episodes":episodes},"links":{"next":next}});
             common::write_reply(&mut stream, reply("", payload), "0");
         }
         let (mut stream, _) = listener.accept().unwrap();
@@ -44,38 +51,115 @@ fn series_snapshot_preserves_independent_paginated_orders() {
     });
     let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
     let snapshot = provider.fetch("series:1").unwrap().unwrap();
-    assert_eq!(snapshot["series"]["defaultSeasonType"], 1);
+    assert_eq!(snapshot["series"], expected_series);
     assert_eq!(snapshot["episode_orders"]["official"][0]["number"], 2);
-    assert_eq!(snapshot["episode_orders"]["absolute"][0]["number"], 7);
+    assert_eq!(snapshot["episode_orders"]["absolute"], json!([{"id":14,"seriesId":1,"seasonNumber":1,"number":9,"absoluteNumber":9}]));
     assert_eq!(snapshot["episode_orders"]["official"][1]["seasonNumber"], 0);
     handle.join().unwrap();
 }
 
 #[test]
-fn incomplete_or_duplicate_order_pages_fail_the_series_acquisition() {
-    for duplicate in [false, true] {
-        let episode = json!({"id":12,"seriesId":1,"seasonNumber":1,"number":1});
-        let final_page = if duplicate {
-            json!({"status":"success","data":{"series":{"id":1},"episodes":[episode.clone()]},"links":{"next":null}})
+fn conflicting_ordered_episodes_are_skipped_without_losing_parents_or_orders() {
+    for (order, case, same_page, reversed) in [
+        ("absolute", "number", false, false),
+        ("absolute", "number", false, true),
+        ("absolute", "number", true, false),
+        ("absolute", "number", true, true),
+        ("absolute", "metadata", true, false),
+        ("absolute", "identical", true, false),
+        ("absolute", "all_conflicting", true, false),
+        ("official", "number", false, true),
+        ("official", "identical", false, false),
+        ("dvd", "number", true, false),
+    ] {
+        let episode = json!({"id":14703,"seriesId":70600,"seasonNumber":1,"number":2,"absoluteNumber":63});
+        let mut changed_episode = episode.clone();
+        changed_episode["number"] = json!(63);
+        match case {
+            "metadata" => changed_episode["name"] = json!("Different title"),
+            "identical" => changed_episode = episode.clone(),
+            _ => {}
+        }
+        let unique_episode = json!({"id":5640498,"seriesId":70600,"seasonNumber":1,"number":1,"absoluteNumber":1});
+        let (first, second) = if reversed {
+            (changed_episode.clone(), episode.clone())
         } else {
-            json!({"status":"success","data":{"series":{"id":1},"episodes":[]}})
+            (episode.clone(), changed_episode.clone())
         };
+        let mut first_page = if same_page {
+            json!([unique_episode.clone(), first.clone(), second.clone()])
+        } else {
+            json!([unique_episode.clone(), first.clone()])
+        };
+        let mut final_page = json!([second.clone(), first.clone(), second.clone(), unique_episode.clone()]);
+        if case == "all_conflicting" {
+            first_page = json!([first.clone(), second.clone()]);
+            final_page = json!([second.clone(), first.clone()]);
+        }
+        let series = json!({"id":70600,"name":"Dateline NBC","defaultSeasonType":1,"seasonTypes":[{"id":1,"type":order}],"seasons":[{"id":1736331,"seriesId":70600,"number":1}]});
         let (endpoint, handle) = server(vec![
             reply("/login", json!({"data":{"token":"fixture"}})),
             reply(
-                "/series/1/extended",
-                json!({"status":"success","data":{"id":1,"defaultSeasonType":1,"seasonTypes":[{"id":1,"type":"official"}]}}),
+                "/series/70600/extended",
+                json!({"status":"success","data":series.clone()}),
             ),
             reply(
-                "page=0",
-                json!({"status":"success","data":{"series":{"id":1},"episodes":[episode]},"links":{"next":"?page=1"}}),
+                match order {
+                    "absolute" => "/series/70600/episodes/absolute?page=0",
+                    "official" => "/series/70600/episodes/official?page=0",
+                    _ => "/series/70600/episodes/dvd?page=0",
+                },
+                json!({"status":"success","data":{"series":{"id":70600},"episodes":first_page},"links":{"next":"?page=1"}}),
             ),
-            reply("page=1", final_page),
+            reply(
+                match order {
+                    "absolute" => "/series/70600/episodes/absolute?page=1",
+                    "official" => "/series/70600/episodes/official?page=1",
+                    _ => "/series/70600/episodes/dvd?page=1",
+                },
+                json!({"status":"success","data":{"series":{"id":70600},"episodes":final_page},"links":{"next":null}}),
+            ),
         ]);
         let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
-        assert!(provider.fetch("series:1").is_err());
+        let snapshot = provider.fetch("series:70600").unwrap().unwrap();
+        assert_eq!(snapshot["series"], series);
+        let expected = match case {
+            "identical" => json!([unique_episode, episode]),
+            "all_conflicting" => json!([]),
+            _ => json!([unique_episode]),
+        };
+        assert_eq!(
+            snapshot["episode_orders"][order],
+            expected,
+            "order={order}, case={case}, same_page={same_page}, reversed={reversed}"
+        );
         handle.join().unwrap();
     }
+}
+
+#[test]
+fn incomplete_order_pages_fail_the_series_acquisition() {
+    let (endpoint, handle) = server(vec![
+        reply("/login", json!({"data":{"token":"fixture"}})),
+        reply(
+            "/series/1/extended",
+            json!({"status":"success","data":{"id":1,"defaultSeasonType":1,"seasonTypes":[{"id":1,"type":"official"}]}}),
+        ),
+        reply(
+            "page=0",
+            json!({"status":"success","data":{"series":{"id":1},"episodes":[{"id":12,"seriesId":1,"seasonNumber":1,"number":1}]},"links":{"next":"?page=1"}}),
+        ),
+        reply(
+            "page=1",
+            json!({"status":"success","data":{"series":{"id":1},"episodes":[]}}),
+        ),
+    ]);
+    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
+    assert_eq!(
+        provider.fetch("series:1").unwrap_err().to_string(),
+        "Missing TVDB pagination links"
+    );
+    handle.join().unwrap();
 }
 
 #[test]

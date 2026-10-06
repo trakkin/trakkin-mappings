@@ -314,7 +314,6 @@ impl Tvdb {
                 .iter()
                 .map(|order| {
                     let mut episodes = Vec::new();
-                    let mut seen = std::collections::BTreeSet::new();
                     let mut page = 0;
                     loop {
                         let result = self.get(
@@ -330,10 +329,6 @@ impl Tvdb {
                                 id(episode, "seriesId")? == record_id,
                                 "TVDB ordered episode belongs to another series"
                             );
-                            ensure!(
-                                seen.insert(id(episode, "id")?),
-                                "Duplicate TVDB ordered episode"
-                            );
                             episodes.push(episode.clone());
                         }
                         let Some(next) = next_page(&result, page)? else {
@@ -341,6 +336,7 @@ impl Tvdb {
                         };
                         page = next;
                     }
+                    let episodes = filter_ordered_episodes(episodes, record_id, order)?;
                     Ok((order.clone(), episodes))
                 })
                 .collect::<Result<_>>()?;
@@ -348,6 +344,35 @@ impl Tvdb {
         }
         Ok(Some(record.clone()))
     }
+}
+
+fn filter_ordered_episodes(episodes: Vec<Value>, series_id: u64, order: &str) -> Result<Vec<Value>> {
+    let mut groups = BTreeMap::<u64, Vec<usize>>::new();
+    for (index, episode) in episodes.iter().enumerate() {
+        groups.entry(id(episode, "id")?).or_default().push(index);
+    }
+    let mut retained = std::collections::BTreeSet::new();
+    let mut skipped = Vec::new();
+    for (episode_id, indices) in groups {
+        let first = &episodes[indices[0]];
+        if indices.iter().all(|index| episodes[*index] == *first) {
+            retained.insert(indices[0]);
+        } else {
+            skipped.push(episode_id);
+        }
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "Warning: skipping {} TVDB episode IDs with conflicting entries for series {series_id}, order {order}: {skipped:?}",
+            skipped.len()
+        );
+    }
+    Ok(episodes
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| retained.contains(index))
+        .map(|(_, episode)| episode)
+        .collect())
 }
 
 fn record_kind(kind: &str) -> Option<&'static str> {
