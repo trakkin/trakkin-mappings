@@ -4,6 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::{fs::OpenOptions, path::PathBuf};
 use trakkin_mappings_ingestion::{
     Operation, Provider,
+    providers::AniList,
     storage::{Paimon, RoutedStorage, Storage},
 };
 
@@ -32,14 +33,21 @@ pub struct Command {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum Source {}
+enum Source {
+    #[value(name = "co.anilist")]
+    Anilist,
+}
 
 impl Source {
     fn name(self) -> &'static str {
-        match self {}
+        match self {
+            Self::Anilist => "co.anilist",
+        }
     }
     fn open(self) -> Result<Box<dyn Provider>> {
-        Ok(match self {})
+        Ok(match self {
+            Self::Anilist => Box::new(AniList::new()?),
+        })
     }
 }
 

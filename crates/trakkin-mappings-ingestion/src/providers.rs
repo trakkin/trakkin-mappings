@@ -1,3 +1,7 @@
+mod anilist;
+
+pub use anilist::AniList;
+
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::Value;
