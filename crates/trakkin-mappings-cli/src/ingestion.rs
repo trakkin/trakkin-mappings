@@ -4,7 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::{fs::OpenOptions, path::PathBuf};
 use trakkin_mappings_ingestion::{
     Operation, Provider,
-    providers::AniList,
+    providers::{AniList, Tmdb},
     storage::{Paimon, RoutedStorage, Storage},
 };
 
@@ -36,17 +36,24 @@ pub struct Command {
 enum Source {
     #[value(name = "co.anilist")]
     Anilist,
+    #[value(name = "org.themoviedb")]
+    Tmdb,
 }
 
 impl Source {
     fn name(self) -> &'static str {
         match self {
             Self::Anilist => "co.anilist",
+            Self::Tmdb => "org.themoviedb",
         }
     }
     fn open(self) -> Result<Box<dyn Provider>> {
         Ok(match self {
             Self::Anilist => Box::new(AniList::new()?),
+            Self::Tmdb => Box::new(Tmdb::new(
+                std::env::var("TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN")
+                    .context("Set TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN")?,
+            )?),
         })
     }
 }
