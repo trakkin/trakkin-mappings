@@ -1,6 +1,10 @@
 mod anilist;
+mod tmdb;
+mod tvdb;
 
 pub use anilist::AniList;
+pub use tmdb::Tmdb;
+pub use tvdb::Tvdb;
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder, Response};

@@ -4,7 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::{fs::OpenOptions, path::PathBuf};
 use trakkin_mappings_ingestion::{
     Operation, Provider,
-    providers::{AniList, Tmdb},
+    providers::{AniList, Tmdb, Tvdb},
     storage::{Paimon, RoutedStorage, Storage},
 };
 
@@ -19,7 +19,7 @@ pub struct Command {
     provider: Option<Source>,
     #[arg(
         long,
-        default_value = "crates/trakkin-mappings-ingestion/java/target",
+        default_value = "crates/trakkin-mappings-ingestion/paimon/target",
         global = true
     )]
     bridge: PathBuf,
@@ -38,6 +38,8 @@ enum Source {
     Anilist,
     #[value(name = "org.themoviedb")]
     Tmdb,
+    #[value(name = "com.thetvdb")]
+    Tvdb,
 }
 
 impl Source {
@@ -45,6 +47,7 @@ impl Source {
         match self {
             Self::Anilist => "co.anilist",
             Self::Tmdb => "org.themoviedb",
+            Self::Tvdb => "com.thetvdb",
         }
     }
     fn open(self) -> Result<Box<dyn Provider>> {
@@ -53,6 +56,11 @@ impl Source {
             Self::Tmdb => Box::new(Tmdb::new(
                 std::env::var("TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN")
                     .context("Set TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN")?,
+            )?),
+            Self::Tvdb => Box::new(Tvdb::new(
+                std::env::var("TRAKKIN_MAPPINGS_INGESTION_TVDB_API_KEY")
+                    .context("Set TRAKKIN_MAPPINGS_INGESTION_TVDB_API_KEY")?,
+                std::env::var("TRAKKIN_MAPPINGS_INGESTION_TVDB_PIN").ok(),
             )?),
         })
     }
@@ -263,5 +271,32 @@ mod tests {
     struct Arguments {
         #[command(flatten)]
         command: Command,
+    }
+
+    #[test]
+    fn provider_and_domain_selection() {
+        let arguments =
+            Arguments::try_parse_from(["ingestion", "--provider", "com.thetvdb", "validate"])
+                .unwrap();
+        let source = arguments.command.provider.unwrap();
+        assert_eq!(source.name(), "com.thetvdb");
+        assert_eq!(
+            trakkin_mappings_ingestion::dataset::select_domains(
+                source.name(),
+                arguments.command.domain.as_deref()
+            )
+            .unwrap(),
+            vec!["movie", "series", "season", "episode"]
+        );
+        let arguments = Arguments::try_parse_from([
+            "ingestion",
+            "--provider",
+            "com.thetvdb",
+            "--domain",
+            "series",
+            "validate",
+        ])
+        .unwrap();
+        assert_eq!(arguments.command.domain.as_deref(), Some("series"));
     }
 }

@@ -48,6 +48,81 @@ fn invalid_batch_sizes_fail_before_configuration_or_storage() {
 }
 
 #[test]
+fn canonical_provider_ids_and_domain_validation() {
+    for source in ["co.anilist", "org.themoviedb", "com.thetvdb"] {
+        let output = command()
+            .args([
+                "ingestion",
+                "--warehouse",
+                "/tmp/unused",
+                "--provider",
+                source,
+                "--domain",
+                "invalid",
+                "validate",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported domain"));
+    }
+}
+
+#[test]
+fn warehouse_flag_overrides_environment() {
+    let output = command()
+        .env("TRAKKIN_MAPPINGS_INGESTION_WAREHOUSE", "/tmp/unused")
+        .args([
+            "ingestion",
+            "--provider",
+            "com.thetvdb",
+            "--domain",
+            "series",
+            "--warehouse",
+            "",
+            "validate",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Warehouse must not be empty"));
+    let output = command()
+        .env("TRAKKIN_MAPPINGS_INGESTION_WAREHOUSE", "/tmp/unused")
+        .args([
+            "ingestion",
+            "--provider",
+            "com.thetvdb",
+            "--domain",
+            "invalid",
+            "validate",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported domain"));
+}
+
+#[test]
+fn writer_lock_defaults_to_selected_bridge_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let bridge = directory.path().join("bridge");
+    let output = command()
+        .args([
+            "ingestion",
+            "--warehouse",
+            directory.path().to_str().unwrap(),
+            "--provider",
+            "co.anilist",
+            "--bridge",
+            bridge.to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Build the Java bridge"));
+    assert!(bridge.join("writer.lock").is_file());
+}
+
+#[test]
 fn warehouse_configuration_is_required() {
     let output = command().args(["ingestion", "validate"]).output().unwrap();
     assert!(!output.status.success());
