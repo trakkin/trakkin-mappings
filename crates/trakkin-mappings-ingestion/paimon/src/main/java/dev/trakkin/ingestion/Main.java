@@ -12,7 +12,7 @@ public final class Main {
                 throw new IllegalArgumentException("Expected protocol v1 open request");
             }
             Map<String, String> settings = storageSettings(System.getenv());
-            try (var mirror = new Mirror(required(open, "warehouse"), settings)) {
+            try (var mirror = new Mirror(required(open, "warehouse"), settings, open.path("create").asBoolean(true))) {
                 respond(Mirror.JSON.createObjectNode());
                 Map<String, Mirror.Entry> index = null;
                 String line;

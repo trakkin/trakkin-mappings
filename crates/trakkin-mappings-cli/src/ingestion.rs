@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use std::{fs::OpenOptions, path::PathBuf};
 use trakkin_mappings_ingestion::{
     Operation, Provider,
@@ -23,7 +24,9 @@ pub struct Command {
         global = true
     )]
     bridge: PathBuf,
-    /// Override the writer lock, which defaults to writer.lock in the bridge directory.
+    /// Override the local writer lock, scoped to warehouse and provider by default.
+    /// Defaults to <provider>.<warehouse-sha256>.writer.lock in the bridge directory.
+    /// Inspect and validate skip locking. Locks do not coordinate across machines.
     #[arg(long, global = true)]
     lock_file: Option<PathBuf>,
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=1000), global = true)]
@@ -109,23 +112,33 @@ impl Command {
                 trakkin_mappings_ingestion::dataset::warehouse(&warehouse, provider.name(), domain)
             })
             .collect::<Result<Vec<_>>>()?;
-        let lock_file = self
-            .lock_file
-            .unwrap_or_else(|| self.bridge.join("writer.lock"));
-        if let Some(parent) = lock_file
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_file)
-            .with_context(|| format!("Open ingestion writer lock {}", lock_file.display()))?;
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .context("Another local mirror operation holds the writer lock")?;
+        let _lock = if matches!(self.operation, Action::Inspect { .. } | Action::Validate) {
+            None
+        } else {
+            let identity: String = Sha256::digest(warehouse.trim_end_matches('/').as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let lock_file = self.lock_file.unwrap_or_else(|| {
+                self.bridge
+                    .join(format!("{}.{identity}.writer.lock", provider.name()))
+            });
+            if let Some(parent) = lock_file
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_file)
+                .with_context(|| format!("Open ingestion writer lock {}", lock_file.display()))?;
+            fs2::FileExt::try_lock_exclusive(&lock)
+                .context("Another local mirror operation holds the writer lock")?;
+            Some(lock)
+        };
         let job_warehouse = trakkin_mappings_ingestion::dataset::job_warehouse(
             &warehouse,
             provider.name(),
@@ -176,7 +189,7 @@ impl Command {
             );
             return Ok(());
         }
-        let mut coordinator = Paimon::open(&self.bridge, &job_warehouse)?;
+        let mut coordinator = Paimon::open_existing(&self.bridge, &job_warehouse)?;
         match self.operation {
             Action::Validate => coordinator.validate()?,
             Action::Maintain => {
@@ -188,7 +201,7 @@ impl Command {
         for (domain, warehouse) in domains.iter().zip(&warehouses) {
             let progress = LiveProgress::new(provider.name(), domain);
             progress.0.set_message("opening storage");
-            let mut storage = Paimon::open(&self.bridge, warehouse)?;
+            let mut storage = Paimon::open_existing(&self.bridge, warehouse)?;
             match &self.operation {
                 Action::Inspect {
                     key,

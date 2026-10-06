@@ -158,6 +158,14 @@ impl Paimon {
     }
 
     pub fn open(bridge: &Path, warehouse: &str) -> Result<Self> {
+        Self::open_mode(bridge, warehouse, true)
+    }
+
+    pub fn open_existing(bridge: &Path, warehouse: &str) -> Result<Self> {
+        Self::open_mode(bridge, warehouse, false)
+    }
+
+    fn open_mode(bridge: &Path, warehouse: &str, create: bool) -> Result<Self> {
         ensure!(
             bridge.join("classes").is_dir(),
             "Build the Java bridge with mvn -f crates/trakkin-mappings-ingestion/paimon/pom.xml package first"
@@ -180,7 +188,8 @@ impl Paimon {
             input,
             output,
         };
-        storage.request(json!({"version":1,"action":"open","warehouse":warehouse}))?;
+        storage
+            .request(json!({"version":1,"action":"open","warehouse":warehouse,"create":create}))?;
         Ok(storage)
     }
 

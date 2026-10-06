@@ -8,6 +8,19 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class MirrorTest {
     @TempDir Path directory;
+    @Test void existingOpenDoesNotCreateMissingTable() {
+        assertThrows(Exception.class, () -> new Mirror(directory.toUri().toString(), Map.of(), false));
+        assertFalse(java.nio.file.Files.exists(directory.resolve("mirrors.db")));
+    }
+
+    @Test void existingOpenReadsCreatedTable() throws Exception {
+        try (var writer = new Mirror(directory.toUri().toString(), Map.of())) {
+            writer.commit("bootstrap", Mirror.JSON.createObjectNode(), Map.of("1", prepared("{\"id\":1}")), Map.of(), writer.index());
+            try (var reader = new Mirror(directory.toUri().toString(), Map.of(), false)) {
+                assertTrue(reader.index().containsKey("1"));
+            }
+        }
+    }
     @Test void mapsS3EnvironmentToHadoopEndpointRegion() {
         assertEquals(Map.of("s3.endpoint", "https://example.r2.cloudflarestorage.com",
             "s3.endpoint.region", "auto", "s3.path.style.access", "true",

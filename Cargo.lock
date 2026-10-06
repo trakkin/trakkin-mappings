@@ -1815,6 +1815,7 @@ dependencies = [
  "fs2",
  "indicatif",
  "serde_json",
+ "sha2",
  "tempfile",
  "trakkin-mappings-corpus",
  "trakkin-mappings-ingestion",

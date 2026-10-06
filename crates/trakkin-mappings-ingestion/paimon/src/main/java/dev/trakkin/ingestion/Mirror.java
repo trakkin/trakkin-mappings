@@ -21,22 +21,28 @@ public final class Mirror implements AutoCloseable {
     }
 
     public Mirror(String warehouse, Map<String, String> settings) throws Exception {
+        this(warehouse, settings, true);
+    }
+
+    public Mirror(String warehouse, Map<String, String> settings, boolean create) throws Exception {
         java.net.InetAddress.getAllByName("localhost");
         Options options = new Options();
         settings.forEach(options::set);
         options.set("warehouse", warehouse);
         catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
-        catalog.createDatabase("mirrors", true);
         identifier = Identifier.create("mirrors", "records");
-        catalog.createTable(identifier, Schema.newBuilder()
-            .column("key", DataTypes.STRING().notNull())
-            .column("hash", DataTypes.STRING())
-            .column("payload", DataTypes.STRING())
-            .column("deleted", DataTypes.BOOLEAN())
-            .primaryKey("key").option("bucket", "1")
-            .option("snapshot.time-retained", "7 d")
-            .option("snapshot.num-retained.min", "2")
-            .option("snapshot.num-retained.max", "1000").build(), true);
+        if (create) {
+            catalog.createDatabase("mirrors", true);
+            catalog.createTable(identifier, Schema.newBuilder()
+                .column("key", DataTypes.STRING().notNull())
+                .column("hash", DataTypes.STRING())
+                .column("payload", DataTypes.STRING())
+                .column("deleted", DataTypes.BOOLEAN())
+                .primaryKey("key").option("bucket", "1")
+                .option("snapshot.time-retained", "7 d")
+                .option("snapshot.num-retained.min", "2")
+                .option("snapshot.num-retained.max", "1000").build(), true);
+        }
         table = catalog.getTable(identifier);
     }
 

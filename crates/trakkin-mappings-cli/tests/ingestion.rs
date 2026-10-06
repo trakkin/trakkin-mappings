@@ -113,13 +113,82 @@ fn writer_lock_defaults_to_selected_bridge_directory() {
             "co.anilist",
             "--bridge",
             bridge.to_str().unwrap(),
-            "validate",
+            "maintain",
         ])
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Build the Java bridge"));
-    assert!(bridge.join("writer.lock").is_file());
+    let names: Vec<_> = std::fs::read_dir(&bridge)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1);
+    assert!(names[0].starts_with("co.anilist."));
+    assert!(names[0].ends_with(".writer.lock"));
+}
+
+#[test]
+fn default_locks_distinguish_providers_and_warehouses_but_not_domains() {
+    let directory = tempfile::tempdir().unwrap();
+    let bridge = directory.path().join("bridge");
+    for (warehouse, provider, domain) in [
+        ("s3://test/warehouse", "org.themoviedb", "movie"),
+        ("s3://test/warehouse/", "org.themoviedb", "tv"),
+        ("s3://test/warehouse", "co.anilist", "media"),
+        ("s3://test/other", "co.anilist", "media"),
+    ] {
+        let output = command()
+            .args([
+                "ingestion",
+                "--warehouse",
+                warehouse,
+                "--provider",
+                provider,
+                "--domain",
+                domain,
+                "--bridge",
+                bridge.to_str().unwrap(),
+                "maintain",
+            ])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Build the Java bridge"));
+    }
+    assert_eq!(std::fs::read_dir(&bridge).unwrap().count(), 3);
+}
+
+#[test]
+fn reads_bypass_writer_lock_but_maintenance_does_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let lock_path = directory.path().join("writer.lock");
+    let lock = std::fs::File::create(&lock_path).unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let bridge = directory.path().join("missing-bridge");
+    for operation in ["inspect", "validate", "maintain"] {
+        let output = command()
+            .args([
+                "ingestion",
+                "--warehouse",
+                directory.path().to_str().unwrap(),
+                "--provider",
+                "co.anilist",
+                "--bridge",
+                bridge.to_str().unwrap(),
+                "--lock-file",
+                lock_path.to_str().unwrap(),
+                operation,
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if operation == "maintain" {
+            assert!(stderr.contains("holds the writer lock"));
+        } else {
+            assert!(stderr.contains("Build the Java bridge"));
+        }
+    }
+    assert!(!bridge.exists());
 }
 
 #[test]
