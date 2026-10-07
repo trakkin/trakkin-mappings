@@ -1,58 +1,19 @@
+use super::catalogue::{Reconciliation, select_domains};
 use super::{Http, array, id};
-use crate::{Change, Page, Provider};
+use crate::{Change, Operation, Page, Provider};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 pub struct Tvdb {
     http: Http,
     token: String,
     endpoint: String,
-    domain: Option<u64>,
-    series_selected: bool,
-}
-
-impl Tvdb {
-    pub fn new(api_key: String, pin: Option<String>) -> Result<Self> {
-        Self::with_endpoint(api_key, pin, "https://api4.thetvdb.com/v4")
-    }
-    pub fn with_endpoint(api_key: String, pin: Option<String>, endpoint: &str) -> Result<Self> {
-        ensure!(
-            !api_key.is_empty(),
-            "TRAKKIN_MAPPINGS_INGESTION_TVDB_API_KEY is required"
-        );
-        let http = Http::new(Duration::from_millis(25))?;
-        let mut body = json!({"apikey":api_key});
-        if let Some(pin) = pin.filter(|pin| !pin.is_empty()) {
-            body["pin"] = json!(pin);
-        }
-        let result = http.json(http.client.post(format!("{endpoint}/login")).json(&body))?;
-        let token = result["data"]["token"]
-            .as_str()
-            .context("Missing TVDB login token")?
-            .to_owned();
-        Ok(Self {
-            http,
-            token,
-            endpoint: endpoint.into(),
-            domain: None,
-            series_selected: true,
-        })
-    }
-    fn get(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
-        let result = self.http.json(
-            self.http
-                .client
-                .get(format!("{}{path}", self.endpoint))
-                .bearer_auth(&self.token)
-                .query(params),
-        )?;
-        ensure!(
-            result["status"] == "success",
-            "TVDB response was not successful"
-        );
-        Ok(result)
-    }
+    domains: BTreeSet<String>,
+    reconciliation: Reconciliation,
 }
 
 fn next_page(result: &Value, page: u64) -> Result<Option<u64>> {
@@ -76,31 +37,76 @@ fn next_page(result: &Value, page: u64) -> Result<Option<u64>> {
     Ok(Some(next))
 }
 
-impl Provider for Tvdb {
-    fn source(&self) -> Option<&'static str> {
-        Some("com.thetvdb")
-    }
-    fn select_domain(&mut self, domain: &str) {
-        self.series_selected = domain == "series";
-        self.domain = match domain {
-            "movie" => Some(0),
-            "series" => Some(1),
-            "season" => Some(2),
-            "episode" => Some(3),
-            _ => None,
-        };
-    }
-    fn select_domains(&mut self, domains: &[&str]) {
-        if let [domain] = domains {
-            self.select_domain(domain);
-        } else {
-            self.domain = None;
-            self.series_selected = domains.contains(&"series");
-        }
+impl Tvdb {
+    pub const DOMAINS: &[&str] = &["movie", "series", "season", "episode"];
+
+    fn single_domain(&self) -> Option<&str> {
+        (self.domains.len() == 1).then(|| self.domains.first().unwrap().as_str())
     }
 
-    fn enumerate(&mut self, cursor: &Value, _started: i64) -> Result<Page> {
-        let kind = cursor["kind"].as_u64().unwrap_or(self.domain.unwrap_or(0));
+    fn scope(&self, mut page: Page) -> Page {
+        page.changes.retain(|change| {
+            change
+                .key()
+                .split_once(':')
+                .is_some_and(|(domain, _)| self.domains.contains(domain))
+        });
+        page
+    }
+
+    pub fn new(api_key: String, pin: Option<String>, domains: &[&str]) -> Result<Self> {
+        Self::with_endpoint(api_key, pin, domains, "https://api4.thetvdb.com/v4")
+    }
+    pub fn with_endpoint(
+        api_key: String,
+        pin: Option<String>,
+        domains: &[&str],
+        endpoint: &str,
+    ) -> Result<Self> {
+        let domains = select_domains(Self::DOMAINS, domains)?;
+        ensure!(
+            !api_key.is_empty(),
+            "TRAKKIN_MAPPINGS_INGESTION_TVDB_API_KEY is required"
+        );
+        let http = Http::new(Duration::from_secs(1).div_f64(50.0))?;
+        let mut body = json!({"apikey":api_key});
+        if let Some(pin) = pin.filter(|pin| !pin.is_empty()) {
+            body["pin"] = json!(pin);
+        }
+        let result = http.json(http.client.post(format!("{endpoint}/login")).json(&body))?;
+        let token = result["data"]["token"]
+            .as_str()
+            .context("Missing TVDB login token")?
+            .to_owned();
+        Ok(Self {
+            http,
+            token,
+            endpoint: endpoint.into(),
+            domains,
+            reconciliation: Reconciliation::default(),
+        })
+    }
+    fn get(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
+        let result = self.http.json(
+            self.http
+                .client
+                .get(format!("{}{path}", self.endpoint))
+                .bearer_auth(&self.token)
+                .query(params),
+        )?;
+        ensure!(
+            result["status"] == "success",
+            "TVDB response was not successful"
+        );
+        Ok(result)
+    }
+
+    fn catalogue(&mut self, cursor: &Value) -> Result<Page> {
+        let first = Self::DOMAINS
+            .iter()
+            .position(|domain| self.domains.contains(*domain))
+            .unwrap();
+        let kind = cursor["kind"].as_u64().unwrap_or(first as u64);
         let (media_type, prefix) = match kind {
             0 => ("movies", "movie"),
             1 => ("series", "series"),
@@ -108,6 +114,10 @@ impl Provider for Tvdb {
             3 => ("episodes", "episode"),
             _ => anyhow::bail!("Invalid TVDB catalogue cursor"),
         };
+        ensure!(
+            self.domains.contains(prefix),
+            "TVDB catalogue cursor belongs to another domain"
+        );
         let page = cursor["page"].as_u64().unwrap_or(0);
         let result = self.get(&format!("/{media_type}"), &[("page", page.to_string())])?;
         let changes = array(&result, "data")?
@@ -117,18 +127,22 @@ impl Provider for Tvdb {
         let next = next_page(&result, page)?
             .map(|page| json!({"kind":kind,"page":page}))
             .or_else(|| {
-                (self.domain.is_none() && kind < 3).then(|| json!({"kind":kind+1,"page":0}))
+                Self::DOMAINS
+                    .iter()
+                    .enumerate()
+                    .skip(kind as usize + 1)
+                    .find(|(_, domain)| self.domains.contains(**domain))
+                    .map(|(kind, _)| json!({"kind":kind,"page":0}))
             });
-        Ok(Page { changes, next })
+        Ok(self.scope(Page { changes, next }))
     }
 
-    fn discover_changes(&mut self, watermark: i64, cursor: &Value, until: i64) -> Result<Page> {
-        if self.series_selected
+    fn changes(&mut self, watermark: i64, cursor: &Value) -> Result<Page> {
+        if self.domains.contains("series")
             && let Some(refresh) = cursor.get("refresh")
         {
             return self.refresh_series(
                 refresh,
-                until,
                 cursor
                     .get("updates")
                     .filter(|value| !value.is_null())
@@ -140,12 +154,11 @@ impl Provider for Tvdb {
             ("since", watermark.saturating_sub(86400).to_string()),
             ("page", page.to_string()),
         ];
-        if let Some(domain) = self.domain.filter(|domain| *domain != 1) {
+        if let Some(domain) = self.single_domain().filter(|domain| *domain != "series") {
             let kind = match domain {
-                0 => "movie",
-                1 => "series",
-                2 => "seasons",
-                3 => "episodes",
+                "movie" => "movie",
+                "season" => "seasons",
+                "episode" => "episodes",
                 _ => unreachable!(),
             };
             params.push(("type", kind.into()));
@@ -155,7 +168,7 @@ impl Provider for Tvdb {
         let mut refresh_all = false;
         let mut parents = BTreeMap::new();
         for update in array(&result, "data")? {
-            if self.series_selected
+            if self.domains.contains("series")
                 && (update["recordType"] == "seasontypes" || update["entityType"] == "seasontypes")
             {
                 refresh_all = true;
@@ -169,7 +182,7 @@ impl Provider for Tvdb {
             ) else {
                 continue;
             };
-            if self.series_selected && matches!(kind, "season" | "episode") {
+            if self.domains.contains("series") && matches!(kind, "season" | "episode") {
                 let key = format!("{kind}:{}", id(update, "recordId")?);
                 let series_id =
                     if let Some(series_id) = update["seriesId"].as_u64().filter(|id| *id > 0) {
@@ -188,7 +201,7 @@ impl Provider for Tvdb {
                 } else {
                     refresh_all = true;
                 }
-                if self.domain == Some(1) {
+                if self.single_domain() == Some("series") {
                     continue;
                 }
             }
@@ -214,38 +227,23 @@ impl Provider for Tvdb {
         }
         let next = next_page(&result, page)?.map(|page| json!({"page":page}));
         if refresh_all {
-            let mut refresh = self.refresh_series(&Value::Null, until, next)?;
+            let mut refresh = self.refresh_series(&Value::Null, next)?;
             changes.append(&mut refresh.changes);
-            return Ok(Page {
+            return Ok(self.scope(Page {
                 changes,
                 next: refresh.next,
-            });
+            }));
         }
-        Ok(Page { changes, next })
+        Ok(self.scope(Page { changes, next }))
     }
 
-    fn fetch(&mut self, key: &str) -> Result<Option<Value>> {
-        self.fetch_record(key)
-    }
-
-    fn fetch_many(&mut self, keys: &[String]) -> Result<BTreeMap<String, Option<Value>>> {
-        super::fetch_many(keys, 12, |key| self.fetch_record(key))
-    }
-}
-
-impl Tvdb {
-    fn refresh_series(
-        &mut self,
-        cursor: &Value,
-        until: i64,
-        updates: Option<Value>,
-    ) -> Result<Page> {
+    fn refresh_series(&mut self, cursor: &Value, updates: Option<Value>) -> Result<Page> {
         let cursor = if cursor.is_null() {
             json!({"kind":1,"page":0})
         } else {
             cursor.clone()
         };
-        let mut page = self.enumerate(&cursor, until)?;
+        let mut page = self.catalogue(&cursor)?;
         if page.next.as_ref().is_some_and(|next| next["kind"] != 1) {
             page.next = None;
         }
@@ -346,7 +344,55 @@ impl Tvdb {
     }
 }
 
-fn filter_ordered_episodes(episodes: Vec<Value>, series_id: u64, order: &str) -> Result<Vec<Value>> {
+impl Provider for Tvdb {
+    fn source(&self) -> &'static str {
+        "com.thetvdb"
+    }
+    fn restore(
+        &mut self,
+        operation: Operation,
+        index: &BTreeMap<String, crate::storage::Entry>,
+        _checkpoint: &Value,
+    ) -> Result<()> {
+        self.reconciliation =
+            Reconciliation::restore(operation, index, |domain| self.domains.contains(domain));
+        Ok(())
+    }
+    fn discover(
+        &mut self,
+        operation: Operation,
+        watermark: Option<i64>,
+        cursor: &Value,
+        _until: i64,
+    ) -> Result<Page> {
+        if operation == Operation::Sync {
+            return self.changes(watermark.context("Missing TVDB watermark")?, cursor);
+        }
+        if operation == Operation::Reconcile
+            && let Some(page) = self.reconciliation.absences(cursor, Change::Dirty)?
+        {
+            return Ok(page);
+        }
+        let mut page = self.catalogue(cursor)?;
+        if operation == Operation::Reconcile {
+            self.reconciliation.observe(&mut page)?;
+        }
+        Ok(page)
+    }
+    fn fetch(&mut self, key: &str) -> Result<Option<Value>> {
+        self.fetch_record(key)
+    }
+
+    fn fetch_many(&mut self, keys: &[String]) -> Result<BTreeMap<String, Option<Value>>> {
+        super::fetch_many(keys, 12, |key| self.fetch_record(key))
+    }
+}
+
+fn filter_ordered_episodes(
+    episodes: Vec<Value>,
+    series_id: u64,
+    order: &str,
+) -> Result<Vec<Value>> {
     let mut groups = BTreeMap::<u64, Vec<usize>>::new();
     for (index, episode) in episodes.iter().enumerate() {
         groups.entry(id(episode, "id")?).or_default().push(index);

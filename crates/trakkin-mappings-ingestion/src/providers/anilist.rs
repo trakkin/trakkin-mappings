@@ -1,66 +1,82 @@
+use super::catalogue::Reconciliation;
 use super::{Http, array, id};
-use crate::{Change, Page, Provider};
+use crate::{Change, Operation, Page, Provider, Resume};
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
-const MEDIA_FIELDS: &str = "id idMal title{romaji english native} type format status description startDate{year month day} endDate{year month day} season seasonYear episodes duration chapters volumes countryOfOrigin source updatedAt genres synonyms isAdult siteUrl relations{edges{id relationType(version:3) node{id type}}}";
+const MEDIA_FIELDS: &str = "id idMal title{romaji english native} type format status description startDate{year month day} endDate{year month day} season seasonYear episodes duration chapters volumes countryOfOrigin source genres synonyms isAdult siteUrl relations{edges{id relationType(version:3) node{id type}}}";
 
-const CATALOGUE_PAGES: usize = 99;
-const CHANGES_PAGES: usize = 83;
-const PAYLOAD_PAGES: usize = 11;
+const IDS_PER_BATCH: usize = 50;
+const CATALOGUE_BATCHES: usize = 160;
+const PAYLOAD_BATCHES: usize = 11;
+const AIRING_PAGES: usize = 83;
+const MAX_PAGES: u64 = 100;
+const AIRING_OVERLAP: i64 = 14 * 86400;
 
-fn page_name(offset: usize) -> String {
-    if offset == 0 {
-        "Page".into()
-    } else {
-        format!("page{offset}")
-    }
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueCursor {
+    #[serde(default)]
+    after: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    through: Option<u64>,
 }
 
-fn pages_query(count: usize, arguments: &str, fields: &str) -> String {
-    let mut query = "query($page:Int!".to_owned();
-    if arguments.contains("$ids") {
-        query.push_str(",$ids:[Int]");
-    }
-    if arguments.contains("$sort") {
-        query.push_str(",$sort:[MediaSort]");
-    }
-    for offset in 1..count {
-        query.push_str(&format!(",$page{offset}:Int!"));
-    }
-    query.push_str("){ ");
-    if fields == "id" {
-        query.push_str("latest:Media(sort:ID_DESC){id} ");
-    }
+struct MediaBatch {
+    records: BTreeMap<u64, Value>,
+    latest: Option<u64>,
+}
+
+fn media_id(key: &str) -> Result<u64> {
+    let media_id = key
+        .strip_prefix("media:")
+        .context("Invalid AniList key")?
+        .parse::<u64>()?;
+    ensure!(
+        media_id > 0 && media_id <= i32::MAX as u64,
+        "Invalid AniList ID"
+    );
+    ensure!(key == format!("media:{media_id}"), "Invalid AniList key");
+    Ok(media_id)
+}
+
+fn airing_query(count: usize) -> String {
+    let mut arguments = vec!["$after:Int!".to_owned(), "$before:Int!".to_owned()];
+    let mut fields = Vec::new();
     for offset in 0..count {
-        let name = page_name(offset);
-        let alias = if offset == 0 {
-            String::new()
-        } else {
-            format!("{name}:")
-        };
-        let page = if offset == 0 { "page".into() } else { name };
-        query.push_str(&format!("{alias}Page(page:${page},perPage:50){{pageInfo{{hasNextPage}} media({arguments}){{{fields}}}}}"));
+        arguments.push(format!("$page{offset}:Int!"));
+        fields.push(format!("page{offset}:Page(page:$page{offset},perPage:50){{pageInfo{{hasNextPage}} airingSchedules(airingAt_greater:$after,airingAt_lesser:$before,sort:ID){{mediaId airingAt}}}}"));
     }
-    query.push('}');
-    query
+    format!("query({}){{{}}}", arguments.join(","), fields.join(" "))
 }
 
 pub struct AniList {
     http: Http,
     endpoint: String,
+    after: u64,
+    existing: HashSet<u64>,
+    reconciliation: Reconciliation,
 }
 
 impl AniList {
+    pub const DOMAINS: &[&str] = &["media"];
+
     pub fn new() -> Result<Self> {
         Self::with_endpoint("https://graphql.anilist.co")
     }
     pub fn with_endpoint(endpoint: &str) -> Result<Self> {
+        Self::with_endpoint_and_interval(endpoint, Duration::from_secs(2))
+    }
+    pub fn with_endpoint_and_interval(endpoint: &str, interval: Duration) -> Result<Self> {
         Ok(Self {
-            http: Http::new(Duration::from_secs(2))?,
+            http: Http::new(interval)?,
             endpoint: endpoint.into(),
+            after: 0,
+            existing: HashSet::new(),
+            reconciliation: Reconciliation::default(),
         })
     }
     fn query(&mut self, query: &str, variables: Value, missing_media: bool) -> Result<Value> {
@@ -102,140 +118,280 @@ impl AniList {
         );
         result.get("data").cloned().context("Missing AniList data")
     }
-    fn pages(
-        &mut self,
-        count: usize,
-        page: u64,
-        arguments: &str,
-        fields: &str,
-        mut variables: Value,
-    ) -> Result<Value> {
-        variables["page"] = json!(page);
-        for offset in 1..count {
-            variables[format!("page{offset}")] = json!(page + offset as u64);
+    fn media_batches(&mut self, ids: &[u64], fields: &str, latest: bool) -> Result<MediaBatch> {
+        let mut arguments = Vec::new();
+        let mut selections = Vec::new();
+        let mut variables = json!({});
+        if latest {
+            selections.push("latest:Media(sort:ID_DESC){id}".to_owned());
         }
-        self.query(&pages_query(count, arguments, fields), variables, false)
-    }
-    fn page(&mut self, cursor: &Value, watermark: Option<i64>) -> Result<Page> {
-        let page = if watermark.is_some() {
-            cursor["page"].as_u64().unwrap_or(1)
+        for (offset, chunk) in ids.chunks(IDS_PER_BATCH).enumerate() {
+            arguments.push(format!("$ids{offset}:[Int!]!"));
+            variables[format!("ids{offset}")] = json!(chunk);
+            selections.push(format!("batch{offset}:Page(page:1,perPage:50){{media(id_in:$ids{offset},sort:ID){{{fields}}}}}"));
+        }
+        let arguments = if arguments.is_empty() {
+            String::new()
         } else {
-            1
+            format!("({})", arguments.join(","))
         };
-        ensure!(
-            page <= 100,
-            "AniList changes exceed pagination depth; reconcile the catalogue"
-        );
-        let after = cursor["after"].as_u64().unwrap_or(0);
-        let sort = if watermark.is_some() {
-            "UPDATED_AT_DESC"
-        } else {
-            "ID"
-        };
-        ensure!(after <= i32::MAX as u64, "Invalid AniList catalogue cursor");
-        let end = after.saturating_add(5000).min(i32::MAX as u64);
-        let ids: Vec<_> = (after + 1..=end).collect();
-        let count = if watermark.is_some() {
-            CHANGES_PAGES.min((101 - page) as usize)
-        } else {
-            CATALOGUE_PAGES
-        };
-        let response = self.pages(
-            count,
-            page,
-            if watermark.is_some() {
-                "sort:$sort"
-            } else {
-                "id_in:$ids,sort:$sort"
-            },
-            if watermark.is_some() {
-                "id updatedAt"
-            } else {
-                "id"
-            },
-            json!({"ids":ids,"sort":[sort,"ID"]}),
+        let response = self.query(
+            &format!("query{arguments}{{{}}}", selections.join(" ")),
+            variables,
+            false,
         )?;
-        let mut changes = Vec::new();
-        let mut reached = false;
-        let mut last_id = after;
-        let mut seen = std::collections::BTreeSet::new();
-        let mut has_next = false;
-        let mut consumed = 0;
-        for offset in 0..count {
-            let result = &response[page_name(offset)];
-            let records = array(result, "media")?;
-            has_next = result["pageInfo"]["hasNextPage"]
-                .as_bool()
-                .context("Missing AniList pageInfo")?;
-            ensure!(
-                !records.is_empty() || !has_next,
-                "Empty AniList page with successor"
-            );
-            for record in records {
+        let mut records = BTreeMap::new();
+        for (offset, chunk) in ids.chunks(IDS_PER_BATCH).enumerate() {
+            for record in array(&response[format!("batch{offset}")], "media")? {
                 let media_id = id(record, "id")?;
-                ensure!(seen.insert(media_id), "Duplicate AniList catalogue ID");
-                if let Some(watermark) = watermark {
-                    let updated = record["updatedAt"]
-                        .as_i64()
-                        .context("Missing AniList updatedAt")?;
-                    if updated < watermark.saturating_sub(86400) {
-                        reached = true;
-                        break;
-                    }
-                } else {
-                    ensure!(
-                        media_id > last_id && media_id <= end,
-                        "AniList catalogue IDs did not advance within window"
-                    );
-                    last_id = media_id;
-                }
-                changes.push(Change::Dirty(format!("media:{media_id}")));
-            }
-            consumed += 1;
-            if reached || !has_next {
-                break;
+                ensure!(
+                    chunk.contains(&media_id),
+                    "AniList returned an unrequested record"
+                );
+                ensure!(
+                    records.insert(media_id, record.clone()).is_none(),
+                    "Duplicate AniList media ID {media_id}"
+                );
             }
         }
-        ensure!(
-            watermark.is_none() || reached || !has_next || page + consumed <= 100,
-            "AniList changes exceed pagination depth; reconcile the catalogue"
-        );
-        let next = if watermark.is_some() {
-            (!reached && has_next).then(|| json!({"page":page+consumed}))
-        } else {
-            let latest = response
+        let latest = if latest {
+            let record = response
                 .get("latest")
                 .context("Missing AniList latest ID")?;
-            let latest = if latest.is_null() {
+            Some(if record.is_null() {
                 0
             } else {
-                id(latest, "id")?
-            };
-            let after = if has_next { last_id } else { end };
-            (after < latest).then(|| json!({"after":after}))
+                id(record, "id")?
+            })
+        } else {
+            None
         };
-        Ok(Page { changes, next })
+        Ok(MediaBatch { records, latest })
+    }
+
+    fn catalogue(
+        &mut self,
+        cursor: &CatalogueCursor,
+        missing_only: bool,
+    ) -> Result<(BTreeSet<u64>, Option<CatalogueCursor>)> {
+        ensure!(
+            cursor.after <= i32::MAX as u64
+                && cursor
+                    .through
+                    .is_none_or(|through| through > cursor.after && through <= i32::MAX as u64),
+            "Invalid AniList catalogue cursor"
+        );
+        let limit = cursor.through.unwrap_or(i32::MAX as u64);
+        let capacity = CATALOGUE_BATCHES * IDS_PER_BATCH;
+        let ids: Vec<_> = (cursor.after + 1..=limit)
+            .filter(|media_id| !missing_only || !self.existing.contains(media_id))
+            .take(capacity)
+            .collect();
+        let end = if ids.len() == capacity {
+            *ids.last().unwrap()
+        } else {
+            limit
+        };
+        if ids.is_empty() && cursor.through.is_some() {
+            self.after = self.after.max(end);
+            return Ok((BTreeSet::new(), None));
+        }
+        let response = self.media_batches(&ids, "id", cursor.through.is_none())?;
+        let through = cursor
+            .through
+            .or(response.latest)
+            .context("Missing AniList catalogue boundary")?;
+        let after = end.min(through).max(cursor.after);
+        self.after = self.after.max(after);
+        let ids = response
+            .records
+            .into_keys()
+            .filter(|media_id| *media_id <= through)
+            .collect();
+        let next = (after < through).then_some(CatalogueCursor {
+            after,
+            through: Some(through),
+        });
+        Ok((ids, next))
+    }
+
+    fn airing_ids(&mut self, start: i64, end: i64) -> Result<BTreeSet<u64>> {
+        let mut ids = BTreeSet::new();
+        let mut windows = vec![(start, end)];
+        while let Some((start, end)) = windows.pop() {
+            let mut page = 1;
+            loop {
+                let count = AIRING_PAGES.min((MAX_PAGES + 1 - page) as usize);
+                let mut variables = json!({"after":start-1,"before":end+1});
+                for offset in 0..count {
+                    variables[format!("page{offset}")] = json!(page + offset as u64);
+                }
+                let response = self.query(&airing_query(count), variables, false)?;
+                let mut has_next = false;
+                for offset in 0..count {
+                    let result = &response[format!("page{offset}")];
+                    let schedules = array(result, "airingSchedules")?;
+                    has_next = result["pageInfo"]["hasNextPage"]
+                        .as_bool()
+                        .context("Missing AniList airing pageInfo")?;
+                    ensure!(
+                        !schedules.is_empty() || !has_next,
+                        "Empty AniList airing page with successor"
+                    );
+                    for schedule in schedules {
+                        let aired = schedule["airingAt"]
+                            .as_i64()
+                            .context("Missing AniList airingAt")?;
+                        ensure!(
+                            aired >= start && aired <= end,
+                            "AniList airing outside requested window"
+                        );
+                        let media_id = id(schedule, "mediaId")?;
+                        ensure!(
+                            media_id <= i32::MAX as u64,
+                            "Invalid AniList airing media ID"
+                        );
+                        ids.insert(media_id);
+                    }
+                    if !has_next {
+                        break;
+                    }
+                }
+                if !has_next {
+                    break;
+                }
+                page += count as u64;
+                if page > MAX_PAGES {
+                    ensure!(
+                        start < end,
+                        "AniList airing events exceed pagination depth within one second"
+                    );
+                    let middle = start + (end - start) / 2;
+                    windows.push((middle + 1, end));
+                    windows.push((start, middle));
+                    break;
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    fn catalogue_page(&mut self, cursor: &Value, missing_only: bool) -> Result<Page> {
+        let cursor = if cursor.is_null() {
+            CatalogueCursor::default()
+        } else {
+            serde_json::from_value(cursor.clone()).context("Invalid AniList catalogue cursor")?
+        };
+        let (ids, next) = self.catalogue(&cursor, missing_only)?;
+        Ok(Page {
+            changes: ids
+                .into_iter()
+                .map(|media_id| Change::Dirty(format!("media:{media_id}")))
+                .collect(),
+            next: next.map(serde_json::to_value).transpose()?,
+        })
+    }
+    fn changes(&mut self, watermark: i64, cursor: &Value, until: i64) -> Result<Page> {
+        ensure!(
+            cursor.is_null(),
+            "AniList sync discovery does not use page cursors"
+        );
+        ensure!(
+            watermark >= 0 && until >= watermark && until < i32::MAX as i64,
+            "Invalid AniList sync time window"
+        );
+        let mut cursor = CatalogueCursor {
+            after: self.after,
+            through: None,
+        };
+        let mut ids = BTreeSet::new();
+        loop {
+            let (discovered, next) = self.catalogue(&cursor, false)?;
+            ids.extend(discovered);
+            let Some(next) = next else { break };
+            cursor = next;
+        }
+        ids.extend(self.airing_ids(watermark.saturating_sub(AIRING_OVERLAP).max(0), until)?);
+        Ok(Page {
+            changes: ids
+                .into_iter()
+                .map(|media_id| Change::Dirty(format!("media:{media_id}")))
+                .collect(),
+            next: None,
+        })
     }
 }
 
 impl Provider for AniList {
-    fn source(&self) -> Option<&'static str> {
-        Some("co.anilist")
+    fn source(&self) -> &'static str {
+        "co.anilist"
     }
-    fn enumerate(&mut self, cursor: &Value, _started: i64) -> Result<Page> {
-        self.page(cursor, None)
+    fn resume(&self, operation: Operation) -> Resume {
+        if operation == Operation::Bootstrap {
+            Resume::Cursor
+        } else {
+            Resume::Restart
+        }
     }
-    fn discover_changes(&mut self, watermark: i64, cursor: &Value, _until: i64) -> Result<Page> {
-        self.page(cursor, Some(watermark))
+    fn restore(
+        &mut self,
+        operation: Operation,
+        index: &BTreeMap<String, crate::storage::Entry>,
+        checkpoint: &Value,
+    ) -> Result<()> {
+        let checkpoint: CatalogueCursor = if checkpoint.is_null() {
+            CatalogueCursor::default()
+        } else {
+            serde_json::from_value(checkpoint.clone()).context("Invalid AniList checkpoint")?
+        };
+        ensure!(
+            checkpoint.after <= i32::MAX as u64 && checkpoint.through.is_none(),
+            "Invalid AniList checkpoint"
+        );
+        self.after = checkpoint.after;
+        self.existing = if operation == Operation::Bootstrap {
+            index
+                .iter()
+                .filter(|(key, entry)| !entry.deleted && key.starts_with("media:"))
+                .map(|(key, _)| media_id(key))
+                .collect::<Result<_>>()?
+        } else {
+            HashSet::new()
+        };
+        self.reconciliation =
+            Reconciliation::restore(operation, index, |domain| Self::DOMAINS.contains(&domain));
+        Ok(())
     }
-    fn restart_changes(&self) -> bool {
-        true
+    fn checkpoint(&self) -> Value {
+        json!({"after":self.after})
+    }
+    fn discover(
+        &mut self,
+        operation: Operation,
+        watermark: Option<i64>,
+        cursor: &Value,
+        until: i64,
+    ) -> Result<Page> {
+        if operation == Operation::Sync {
+            return self.changes(
+                watermark.context("Missing AniList watermark")?,
+                cursor,
+                until,
+            );
+        }
+        if operation == Operation::Reconcile
+            && let Some(page) = self.reconciliation.absences(cursor, Change::Dirty)?
+        {
+            return Ok(page);
+        }
+        let mut page = self.catalogue_page(cursor, operation == Operation::Bootstrap)?;
+        if operation == Operation::Reconcile {
+            self.reconciliation.observe(&mut page)?;
+        }
+        Ok(page)
     }
     fn fetch(&mut self, key: &str) -> Result<Option<Value>> {
-        let media_id: u64 = key
-            .strip_prefix("media:")
-            .context("Invalid AniList key")?
-            .parse()?;
+        let media_id = media_id(key)?;
         let response = self.query(
             &format!("query($id:Int!){{Media(id:$id){{{MEDIA_FIELDS}}}}}"),
             json!({"id":media_id}),
@@ -253,70 +409,29 @@ impl Provider for AniList {
         );
         Ok(Some(record.clone()))
     }
+    fn fetch_batch_size(&self) -> usize {
+        PAYLOAD_BATCHES * IDS_PER_BATCH
+    }
     fn fetch_many(&mut self, keys: &[String]) -> Result<BTreeMap<String, Option<Value>>> {
         let mut records = BTreeMap::new();
-        for chunk in keys.chunks(5000) {
-            let ids: Vec<u64> = chunk
-                .iter()
-                .map(|key| {
-                    let media_id = key
-                        .strip_prefix("media:")
-                        .context("Invalid AniList key")?
-                        .parse()?;
-                    ensure!(
-                        media_id > 0 && media_id <= i32::MAX as u64,
-                        "Invalid AniList ID"
-                    );
-                    Ok(media_id)
-                })
-                .collect::<Result<_>>()?;
-            let mut page = 1;
-            while page <= 100 {
-                let count = PAYLOAD_PAGES
-                    .min(ids.len().div_ceil(50))
-                    .min((101 - page) as usize);
-                let response = self.pages(
-                    count,
-                    page,
-                    "id_in:$ids,sort:ID",
-                    MEDIA_FIELDS,
-                    json!({"ids":ids}),
-                )?;
-                let mut has_next = false;
-                for offset in 0..count {
-                    let result = &response[page_name(offset)];
-                    has_next = result["pageInfo"]["hasNextPage"]
-                        .as_bool()
-                        .context("Missing AniList batch pageInfo")?;
-                    let media = array(result, "media")?;
-                    for record in media {
-                        let media_id = id(record, "id")?;
-                        ensure!(
-                            ids.contains(&media_id),
-                            "AniList returned an unrequested record"
-                        );
-                        ensure!(
-                            records
-                                .insert(format!("media:{media_id}"), Some(record.clone()))
-                                .is_none(),
-                            "Duplicate AniList record"
-                        );
-                    }
-                    if chunk.iter().all(|key| records.contains_key(key)) || !has_next {
-                        break;
-                    }
-                    ensure!(!media.is_empty(), "Empty AniList batch page with successor");
-                }
-                if chunk.iter().all(|key| records.contains_key(key)) || !has_next {
-                    break;
-                }
-                page += count as u64;
-                ensure!(page <= 100, "AniList batch pagination did not complete");
-            }
-            for key in chunk {
-                if !records.contains_key(key) {
-                    records.insert(key.clone(), self.fetch(key)?);
-                }
+        let ids = keys
+            .iter()
+            .map(|key| media_id(key))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            ids.iter().copied().collect::<BTreeSet<_>>().len() == ids.len(),
+            "Duplicate AniList fetch key"
+        );
+        for chunk in ids.chunks(PAYLOAD_BATCHES * IDS_PER_BATCH) {
+            let mut fetched = self.media_batches(chunk, MEDIA_FIELDS, false)?.records;
+            for media_id in chunk {
+                let key = format!("media:{media_id}");
+                let record = if let Some(record) = fetched.remove(media_id) {
+                    Some(record)
+                } else {
+                    self.fetch(&key)?
+                };
+                records.insert(key, record);
             }
         }
         Ok(records)

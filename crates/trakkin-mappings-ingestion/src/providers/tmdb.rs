@@ -1,5 +1,6 @@
+use super::catalogue::{Reconciliation, select_domains};
 use super::{Http, array, id};
-use crate::{Change, Page, Provider};
+use crate::{Change, Operation, Page, Provider};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration as Days};
 use flate2::read::GzDecoder;
@@ -19,18 +20,28 @@ const EXPORTS: [(&str, &str); 4] = [
     ("tv", "adult_tv_series_ids"),
 ];
 
+struct ExportSpool {
+    number: usize,
+    _file: NamedTempFile,
+    reader: BufReader<File>,
+}
+
 pub struct Tmdb {
     http: Http,
     token: String,
     endpoint: String,
     exports: String,
-    spool: Option<(usize, NamedTempFile, BufReader<File>)>,
+    spool: Option<ExportSpool>,
     domains: BTreeSet<String>,
     metadata: BTreeMap<String, Value>,
     acquired: BTreeMap<String, Option<Value>>,
+    members: BTreeMap<String, BTreeSet<String>>,
+    reconciliation: Reconciliation,
 }
 
 impl Tmdb {
+    pub const DOMAINS: &[&str] = &["movie", "tv", "season", "episode", "episode_group"];
+
     fn catalogue_route(&self) -> (usize, usize) {
         if self.domains.contains("movie") {
             if self.domains.len() == 1 {
@@ -49,34 +60,43 @@ impl Tmdb {
             .any(|domain| self.domains.contains(*domain))
     }
 
-    pub fn new(token: String) -> Result<Self> {
+    pub fn new(token: String, domains: &[&str]) -> Result<Self> {
         Self::with_endpoints(
             token,
+            domains,
             "https://api.themoviedb.org/3",
             "https://files.tmdb.org/p/exports",
         )
     }
-    pub fn with_endpoints(token: String, endpoint: &str, exports: &str) -> Result<Self> {
+    pub fn with_endpoints(
+        token: String,
+        domains: &[&str],
+        endpoint: &str,
+        exports: &str,
+    ) -> Result<Self> {
+        let domains = select_domains(Self::DOMAINS, domains)?;
         ensure!(
             !token.is_empty(),
             "TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN is required"
         );
         Ok(Self {
-            http: Http::new(Duration::from_secs(1).div_f64(35.0))?,
+            http: Http::new(Duration::from_secs(1).div_f64(50.0))?,
             token,
             endpoint: endpoint.into(),
             exports: exports.into(),
             spool: None,
-            domains: ["movie".into(), "tv".into()].into(),
+            domains,
             metadata: BTreeMap::new(),
             acquired: BTreeMap::new(),
+            members: BTreeMap::new(),
+            reconciliation: Reconciliation::default(),
         })
     }
     fn export(&mut self, number: usize, started: i64) -> Result<()> {
         if self
             .spool
             .as_ref()
-            .is_some_and(|(current, _, _)| *current == number)
+            .is_some_and(|spool| spool.number == number)
         {
             return Ok(());
         }
@@ -99,39 +119,37 @@ impl Tmdb {
         std::io::copy(&mut GzDecoder::new(response), file.as_file_mut())
             .context("Download and verify TMDB gzip export")?;
         let reader = BufReader::new(file.reopen()?);
-        self.spool = Some((number, file, reader));
+        self.spool = Some(ExportSpool {
+            number,
+            _file: file,
+            reader,
+        });
         Ok(())
     }
-}
 
-impl Provider for Tmdb {
-    fn source(&self) -> Option<&'static str> {
-        Some("org.themoviedb")
-    }
-    fn restore(&mut self, index: &BTreeMap<String, crate::storage::Entry>) -> Result<()> {
-        self.metadata = index
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.metadata.clone()))
-            .collect();
-        Ok(())
-    }
-    fn metadata(&self, key: &str) -> Value {
-        self.metadata.get(key).cloned().unwrap_or(json!({}))
-    }
-    fn confirm_absence(&self, key: &str) -> bool {
-        matches!(
-            key.split_once(':').map(|(domain, _)| domain),
-            Some("movie" | "tv")
-        )
-    }
-    fn select_domain(&mut self, domain: &str) {
-        self.select_domains(&[domain]);
-    }
-    fn select_domains(&mut self, domains: &[&str]) {
-        self.domains = domains.iter().map(|domain| (*domain).into()).collect();
+    fn fetch_record(&self, key: &str) -> Result<Option<Value>> {
+        if let Some(record) = self.acquired.get(key) {
+            return Ok(record.clone());
+        }
+        let address = self
+            .metadata
+            .get(key)
+            .and_then(|metadata| metadata["address"].as_str())
+            .unwrap_or(key);
+        let record = fetch_address(&self.http, &self.token, &self.endpoint, address)?;
+        if address != key
+            && let Some(record) = &record
+        {
+            let expected: u64 = key.split_once(':').context("Invalid TMDB key")?.1.parse()?;
+            ensure!(
+                id(record, "id")? == expected,
+                "TMDB address now belongs to another entity"
+            );
+        }
+        Ok(record)
     }
 
-    fn enumerate(&mut self, cursor: &Value, started: i64) -> Result<Page> {
+    fn catalogue(&mut self, cursor: &Value, started: i64) -> Result<Page> {
         self.acquired.clear();
         let (first, step) = self.catalogue_route();
         let number = cursor["export"].as_u64().unwrap_or(first as u64) as usize;
@@ -144,9 +162,9 @@ impl Provider for Tmdb {
         let opened = !self
             .spool
             .as_ref()
-            .is_some_and(|(current, _, _)| *current == number);
+            .is_some_and(|spool| spool.number == number);
         self.export(number, started)?;
-        let reader = &mut self.spool.as_mut().unwrap().2;
+        let reader = &mut self.spool.as_mut().unwrap().reader;
         if opened {
             for _ in 0..cursor["offset"].as_u64().unwrap_or(0) {
                 let mut line = String::new();
@@ -187,7 +205,7 @@ impl Provider for Tmdb {
         Ok(Page { changes, next })
     }
 
-    fn discover_changes(&mut self, watermark: i64, cursor: &Value, until: i64) -> Result<Page> {
+    fn changes(&mut self, watermark: i64, cursor: &Value, until: i64) -> Result<Page> {
         self.acquired.clear();
         let (first, _) = self.catalogue_route();
         let kind = cursor["kind"].as_u64().unwrap_or(first as u64);
@@ -251,118 +269,9 @@ impl Provider for Tmdb {
         Ok(Page { changes, next })
     }
 
-    fn fetch(&mut self, key: &str) -> Result<Option<Value>> {
-        if let Some(record) = self.acquired.get(key) {
-            return Ok(record.clone());
-        }
-        let address = self
-            .metadata
-            .get(key)
-            .and_then(|metadata| metadata["address"].as_str())
-            .unwrap_or(key);
-        let record = fetch_record(&self.http, &self.token, &self.endpoint, address)?;
-        if address != key
-            && let Some(record) = &record
-        {
-            let expected: u64 = key.split_once(':').context("Invalid TMDB key")?.1.parse()?;
-            ensure!(
-                id(record, "id")? == expected,
-                "TMDB address now belongs to another entity"
-            );
-        }
-        Ok(record)
-    }
-
-    fn fetch_many(&mut self, keys: &[String]) -> Result<BTreeMap<String, Option<Value>>> {
-        super::fetch_many(keys, 16, |key| {
-            if let Some(record) = self.acquired.get(key) {
-                return Ok(record.clone());
-            }
-            let address = self
-                .metadata
-                .get(key)
-                .and_then(|metadata| metadata["address"].as_str())
-                .unwrap_or(key);
-            let record = fetch_record(&self.http, &self.token, &self.endpoint, address)?;
-            if address != key
-                && let Some(record) = &record
-            {
-                let expected: u64 = key.split_once(':').context("Invalid TMDB key")?.1.parse()?;
-                ensure!(
-                    id(record, "id")? == expected,
-                    "TMDB address now belongs to another entity"
-                );
-            }
-            Ok(record)
-        })
-    }
-}
-
-fn fetch_record(http: &Http, token: &str, endpoint: &str, key: &str) -> Result<Option<Value>> {
-    let (kind, record_id) = key.split_once(':').context("Invalid TMDB key")?;
-    if kind == "episode_group" {
-        ensure!(
-            !record_id.is_empty() && record_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
-            "Invalid TMDB episode group ID"
-        );
-        let response = http.send(
-            http.client
-                .get(format!("{endpoint}/tv/episode_group/{record_id}"))
-                .bearer_auth(token),
-        )?;
-        if response.status().as_u16() == 404 {
-            return Ok(None);
-        }
-        let record: Value = response.json()?;
-        ensure!(
-            record["id"].as_str() == Some(record_id),
-            "TMDB returned a different episode group"
-        );
-        array(&record, "groups")?;
-        return Ok(Some(record));
-    }
-    let parts = record_id
-        .split('/')
-        .map(str::parse::<u64>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let path = match (kind, parts.as_slice()) {
-        ("movie" | "tv", [record_id]) if *record_id > 0 => format!("{kind}/{record_id}"),
-        ("season", [show, season]) if *show > 0 => format!("tv/{show}/season/{season}"),
-        ("episode", [show, season, episode]) if *show > 0 && *episode > 0 => {
-            format!("tv/{show}/season/{season}/episode/{episode}")
-        }
-        _ => anyhow::bail!("Invalid TMDB record key"),
-    };
-    let response = http.send(
-        http.client
-            .get(format!("{endpoint}/{path}"))
-            .bearer_auth(token)
-            .query(&[("append_to_response", "external_ids")]),
-    )?;
-    if response.status().as_u16() == 404 {
-        return Ok(None);
-    }
-    let record: Value = response.json()?;
-    let native_id = id(&record, "id")?;
-    match parts.as_slice() {
-        [expected] => ensure!(native_id == *expected, "TMDB returned a different record"),
-        [_, season] => ensure!(
-            record["season_number"].as_u64() == Some(*season),
-            "TMDB returned a different season"
-        ),
-        [_, season, episode] => ensure!(
-            record["season_number"].as_u64() == Some(*season)
-                && record["episode_number"].as_u64() == Some(*episode),
-            "TMDB returned a different episode"
-        ),
-        _ => unreachable!(),
-    }
-    Ok(Some(record))
-}
-
-impl Tmdb {
     fn children(&mut self, parents: Vec<Change>, catalogue: bool) -> Result<Vec<Change>> {
         let mut changes = Vec::new();
+        let mut memberships = Vec::new();
         for parent in parents {
             let Change::Dirty(key) = parent else { continue };
             let show = key.strip_prefix("tv:").context("Expected TMDB show")?;
@@ -370,10 +279,7 @@ impl Tmdb {
             let mut members = BTreeSet::new();
             let Some(record) = self.fetch(&key)? else {
                 ensure!(!catalogue, "TMDB catalogue contains an unavailable show");
-                changes.push(Change::Membership {
-                    parent,
-                    keys: members,
-                });
+                memberships.push((parent, members));
                 if self.domains.contains("tv") {
                     self.acquired.insert(key.clone(), None);
                     changes.push(Change::Dirty(key));
@@ -416,7 +322,7 @@ impl Tmdb {
                     let number = season["season_number"]
                         .as_u64()
                         .context("Missing TMDB season number")?;
-                    let record = fetch_record(
+                    let record = fetch_address(
                         &self.http,
                         &self.token,
                         &self.endpoint,
@@ -452,25 +358,208 @@ impl Tmdb {
                         .get(position)
                         .context("Missing TMDB season acquisition")?;
                     for episode in array(season, "episodes")? {
-                        let episode_id = id(episode, "id")?;
-                        let episode_number = id(episode, "episode_number")?;
-                        ensure!(
-                            episode["season_number"].as_u64() == Some(number)
-                                && episode["show_id"].as_u64() == show.parse::<u64>().ok(),
-                            "TMDB episode belongs to another season or show"
-                        );
+                        let episode_id = id(episode, "id").with_context(|| {
+                            format!(
+                                "Invalid TMDB episode ID at episode:{show}/{number}/{} (id={})",
+                                episode["episode_number"], episode["id"]
+                            )
+                        })?;
+                        let episode_number = episode["episode_number"].as_u64().with_context(|| {
+                            format!(
+                                "Invalid TMDB episode number for episode {episode_id} in season:{show}/{number} (episode_number={})",
+                                episode["episode_number"]
+                            )
+                        })?;
                         let native = format!("episode:{episode_id}");
-                        self.metadata.insert(native.clone(), json!({"address":format!("episode:{show}/{number}/{episode_number}"),"parent":parent,"season_id":season_id}));
+                        let address = format!("episode:{show}/{number}/{episode_number}");
+                        let season_matches = episode["season_number"].as_u64() == Some(number);
+                        let show_matches = episode["show_id"].as_u64() == show.parse::<u64>().ok();
+                        let verified = if season_matches && !show_matches {
+                            fetch_address(&self.http, &self.token, &self.endpoint, &address)?
+                        } else {
+                            None
+                        };
+                        ensure!(
+                            season_matches
+                                && (show_matches
+                                    || verified.as_ref().and_then(|record| record["id"].as_u64())
+                                        == Some(episode_id)),
+                            "TMDB episode {episode_id} at episode:{show}/{number}/{episode_number} belongs to another season or show (season_number={}, show_id={})",
+                            episode["season_number"],
+                            episode["show_id"]
+                        );
+                        if let Some(record) = verified {
+                            self.acquired.insert(native.clone(), Some(record));
+                        }
+                        self.metadata.insert(
+                            native.clone(),
+                            json!({"address":address,"parent":parent,"season_id":season_id}),
+                        );
                         members.insert(native.clone());
                         changes.push(Change::Dirty(native));
                     }
                 }
             }
-            changes.push(Change::Membership {
-                parent,
-                keys: members,
-            });
+            memberships.push((parent, members));
+        }
+        for (parent, members) in memberships {
+            let previous = self
+                .members
+                .insert(parent.clone(), members.clone())
+                .unwrap_or_default();
+            for key in previous.difference(&members) {
+                if self.metadata[key]["parent"].as_str() == Some(parent.as_str())
+                    && key
+                        .split_once(':')
+                        .is_some_and(|(domain, _)| self.domains.contains(domain))
+                {
+                    changes.push(Change::Deleted {
+                        key: key.clone(),
+                        metadata: json!({"reason":"parent_membership_absent","parent":parent}),
+                    });
+                }
+            }
         }
         Ok(changes)
     }
+}
+
+impl Provider for Tmdb {
+    fn source(&self) -> &'static str {
+        "org.themoviedb"
+    }
+    fn restore(
+        &mut self,
+        operation: Operation,
+        index: &BTreeMap<String, crate::storage::Entry>,
+        _checkpoint: &Value,
+    ) -> Result<()> {
+        self.spool = None;
+        self.acquired.clear();
+        self.reconciliation =
+            Reconciliation::restore(operation, index, |domain| self.domains.contains(domain));
+        self.members.clear();
+        for (key, entry) in index {
+            if !entry.deleted
+                && let Some(parent) = entry.metadata["parent"].as_str()
+            {
+                self.members
+                    .entry(parent.into())
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+        self.metadata = index
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.metadata.clone()))
+            .collect();
+        Ok(())
+    }
+    fn metadata(&self, key: &str) -> Value {
+        self.metadata.get(key).cloned().unwrap_or(json!({}))
+    }
+    fn discover(
+        &mut self,
+        operation: Operation,
+        watermark: Option<i64>,
+        cursor: &Value,
+        until: i64,
+    ) -> Result<Page> {
+        if operation == Operation::Sync {
+            return self.changes(watermark.context("Missing TMDB watermark")?, cursor, until);
+        }
+        self.acquired.clear();
+        if operation == Operation::Reconcile
+            && let Some(page) = self.reconciliation.absences(cursor, |key| {
+                if matches!(
+                    key.split_once(':').map(|(domain, _)| domain),
+                    Some("movie" | "tv")
+                ) {
+                    Change::Dirty(key)
+                } else {
+                    Change::Deleted {
+                        key,
+                        metadata: json!({"reason":"catalogue_absent"}),
+                    }
+                }
+            })?
+        {
+            return Ok(page);
+        }
+        let mut page = self.catalogue(cursor, until)?;
+        if operation == Operation::Reconcile {
+            self.reconciliation.observe(&mut page)?;
+        }
+        Ok(page)
+    }
+    fn fetch(&mut self, key: &str) -> Result<Option<Value>> {
+        self.fetch_record(key)
+    }
+
+    fn fetch_many(&mut self, keys: &[String]) -> Result<BTreeMap<String, Option<Value>>> {
+        super::fetch_many(keys, 16, |key| self.fetch_record(key))
+    }
+}
+
+fn fetch_address(http: &Http, token: &str, endpoint: &str, key: &str) -> Result<Option<Value>> {
+    let (kind, record_id) = key.split_once(':').context("Invalid TMDB key")?;
+    if kind == "episode_group" {
+        ensure!(
+            !record_id.is_empty() && record_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "Invalid TMDB episode group ID"
+        );
+        let response = http.send(
+            http.client
+                .get(format!("{endpoint}/tv/episode_group/{record_id}"))
+                .bearer_auth(token),
+        )?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let record: Value = response.json()?;
+        ensure!(
+            record["id"].as_str() == Some(record_id),
+            "TMDB returned a different episode group"
+        );
+        array(&record, "groups")?;
+        return Ok(Some(record));
+    }
+    let parts = record_id
+        .split('/')
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let path = match (kind, parts.as_slice()) {
+        ("movie" | "tv", [record_id]) if *record_id > 0 => format!("{kind}/{record_id}"),
+        ("season", [show, season]) if *show > 0 => format!("tv/{show}/season/{season}"),
+        ("episode", [show, season, episode]) if *show > 0 => {
+            format!("tv/{show}/season/{season}/episode/{episode}")
+        }
+        _ => anyhow::bail!("Invalid TMDB record key"),
+    };
+    let response = http.send(
+        http.client
+            .get(format!("{endpoint}/{path}"))
+            .bearer_auth(token)
+            .query(&[("append_to_response", "external_ids")]),
+    )?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let record: Value = response.json()?;
+    let native_id = id(&record, "id")
+        .with_context(|| format!("Invalid TMDB record ID at {key} (id={})", record["id"]))?;
+    match parts.as_slice() {
+        [expected] => ensure!(native_id == *expected, "TMDB returned a different record"),
+        [_, season] => ensure!(
+            record["season_number"].as_u64() == Some(*season),
+            "TMDB returned a different season"
+        ),
+        [_, season, episode] => ensure!(
+            record["season_number"].as_u64() == Some(*season)
+                && record["episode_number"].as_u64() == Some(*episode),
+            "TMDB returned a different episode"
+        ),
+        _ => unreachable!(),
+    }
+    Ok(Some(record))
 }

@@ -1,8 +1,133 @@
 mod common;
 
-use common::{reply, server};
+use common::{Reply, reply, server};
 use serde_json::{Value, json};
-use trakkin_mappings_ingestion::{Change, Provider, providers::Tvdb};
+use std::collections::BTreeMap;
+use trakkin_mappings_ingestion::{Change, Operation, Provider, providers::Tvdb, storage::Entry};
+
+#[test]
+fn multi_domain_catalogues_skip_unselected_endpoints() {
+    let (endpoint, handle) = server(vec![
+        reply("/login", json!({"data":{"token":"fixture"}})),
+        reply(
+            "/movies?page=0",
+            json!({"status":"success","data":[{"id":1}],"links":{"next":null}}),
+        ),
+        reply(
+            "/episodes?page=0",
+            json!({"status":"success","data":[{"id":2}],"links":{"next":null}}),
+        ),
+    ]);
+    let mut provider =
+        Tvdb::with_endpoint("fixture".into(), None, &["movie", "episode"], &endpoint).unwrap();
+    let movies = provider
+        .discover(Operation::Bootstrap, None, &Value::Null, 100)
+        .unwrap();
+    let episodes = provider
+        .discover(Operation::Bootstrap, None, &movies.next.unwrap(), 100)
+        .unwrap();
+    assert_eq!(movies.changes[0].key(), "movie:1");
+    assert_eq!(episodes.changes[0].key(), "episode:2");
+    assert!(episodes.next.is_none());
+    handle.join().unwrap();
+}
+
+#[test]
+fn reconciliation_confirms_absences_only_after_selected_catalogue_completion() {
+    let (endpoint, handle) = server(vec![
+        reply("/login", json!({"data":{"token":"fixture"}})),
+        reply(
+            "/movies?page=0",
+            json!({"status":"success","data":[{"id":1}],"links":{"next":"?page=1"}}),
+        ),
+        reply(
+            "/movies?page=1",
+            json!({"status":"success","data":[],"links":{"next":null}}),
+        ),
+        Reply {
+            status: 404,
+            body: b"{}".to_vec(),
+            expected: "/movies/2/extended",
+        },
+    ]);
+    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &["movie"], &endpoint).unwrap();
+    let index = BTreeMap::from([
+        (
+            "movie:1".into(),
+            Entry {
+                hash: "old".into(),
+                deleted: false,
+                metadata: json!({}),
+            },
+        ),
+        (
+            "movie:2".into(),
+            Entry {
+                hash: "old".into(),
+                deleted: false,
+                metadata: json!({}),
+            },
+        ),
+        (
+            "series:3".into(),
+            Entry {
+                hash: "old".into(),
+                deleted: false,
+                metadata: json!({}),
+            },
+        ),
+        (
+            "movie:4".into(),
+            Entry {
+                hash: "old".into(),
+                deleted: true,
+                metadata: json!({}),
+            },
+        ),
+    ]);
+    provider
+        .restore(Operation::Reconcile, &index, &Value::Null)
+        .unwrap();
+    let first = provider
+        .discover(Operation::Reconcile, None, &Value::Null, 100)
+        .unwrap();
+    assert!(matches!(&first.changes[..], [Change::Dirty(key)] if key == "movie:1"));
+    assert_eq!(first.next, Some(json!({"kind":0,"page":1})));
+    let last = provider
+        .discover(Operation::Reconcile, None, &first.next.unwrap(), 100)
+        .unwrap();
+    assert!(last.changes.is_empty());
+    assert_eq!(last.next, Some(json!({"absent":0})));
+    let absent = provider
+        .discover(Operation::Reconcile, None, &last.next.unwrap(), 100)
+        .unwrap();
+    assert!(matches!(&absent.changes[..], [Change::Dirty(key)] if key == "movie:2"));
+    assert!(absent.next.is_none());
+    assert!(provider.fetch("movie:2").unwrap().is_none());
+    handle.join().unwrap();
+}
+
+#[test]
+fn reconciliation_rejects_empty_selected_catalogues_before_absence_checks() {
+    let (endpoint, handle) = server(vec![
+        reply("/login", json!({"data":{"token":"fixture"}})),
+        reply(
+            "/episodes?page=0",
+            json!({"status":"success","data":[],"links":{"next":null}}),
+        ),
+    ]);
+    let mut provider =
+        Tvdb::with_endpoint("fixture".into(), None, &["episode"], &endpoint).unwrap();
+    provider
+        .restore(Operation::Reconcile, &BTreeMap::new(), &Value::Null)
+        .unwrap();
+    assert!(
+        provider
+            .discover(Operation::Reconcile, None, &Value::Null, 100)
+            .is_err()
+    );
+    handle.join().unwrap();
+}
 
 #[test]
 fn series_snapshot_preserves_parents_and_unaffected_paginated_orders() {
@@ -33,7 +158,7 @@ fn series_snapshot_preserves_parents_and_unaffected_paginated_orders() {
             let episodes = if absolute {
                 json!([episode(7,7),episode(8,7),{"id":14,"seriesId":1,"seasonNumber":1,"number":9,"absoluteNumber":9}])
             } else {
-                json!([episode(2,7)])
+                json!([episode(2, 7)])
             };
             let payload = json!({"status":"success","data":{"series":{"id":1},"episodes":episodes},"links":{"next":next}});
             common::write_reply(&mut stream, reply("", payload), "0");
@@ -49,11 +174,15 @@ fn series_snapshot_preserves_parents_and_unaffected_paginated_orders() {
             "0",
         );
     });
-    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
+    let mut provider =
+        Tvdb::with_endpoint("fixture".into(), None, Tvdb::DOMAINS, &endpoint).unwrap();
     let snapshot = provider.fetch("series:1").unwrap().unwrap();
     assert_eq!(snapshot["series"], expected_series);
     assert_eq!(snapshot["episode_orders"]["official"][0]["number"], 2);
-    assert_eq!(snapshot["episode_orders"]["absolute"], json!([{"id":14,"seriesId":1,"seasonNumber":1,"number":9,"absoluteNumber":9}]));
+    assert_eq!(
+        snapshot["episode_orders"]["absolute"],
+        json!([{"id":14,"seriesId":1,"seasonNumber":1,"number":9,"absoluteNumber":9}])
+    );
     assert_eq!(snapshot["episode_orders"]["official"][1]["seasonNumber"], 0);
     handle.join().unwrap();
 }
@@ -72,7 +201,8 @@ fn conflicting_ordered_episodes_are_skipped_without_losing_parents_or_orders() {
         ("official", "identical", false, false),
         ("dvd", "number", true, false),
     ] {
-        let episode = json!({"id":14703,"seriesId":70600,"seasonNumber":1,"number":2,"absoluteNumber":63});
+        let episode =
+            json!({"id":14703,"seriesId":70600,"seasonNumber":1,"number":2,"absoluteNumber":63});
         let mut changed_episode = episode.clone();
         changed_episode["number"] = json!(63);
         match case {
@@ -80,7 +210,8 @@ fn conflicting_ordered_episodes_are_skipped_without_losing_parents_or_orders() {
             "identical" => changed_episode = episode.clone(),
             _ => {}
         }
-        let unique_episode = json!({"id":5640498,"seriesId":70600,"seasonNumber":1,"number":1,"absoluteNumber":1});
+        let unique_episode =
+            json!({"id":5640498,"seriesId":70600,"seasonNumber":1,"number":1,"absoluteNumber":1});
         let (first, second) = if reversed {
             (changed_episode.clone(), episode.clone())
         } else {
@@ -91,7 +222,12 @@ fn conflicting_ordered_episodes_are_skipped_without_losing_parents_or_orders() {
         } else {
             json!([unique_episode.clone(), first.clone()])
         };
-        let mut final_page = json!([second.clone(), first.clone(), second.clone(), unique_episode.clone()]);
+        let mut final_page = json!([
+            second.clone(),
+            first.clone(),
+            second.clone(),
+            unique_episode.clone()
+        ]);
         if case == "all_conflicting" {
             first_page = json!([first.clone(), second.clone()]);
             final_page = json!([second.clone(), first.clone()]);
@@ -120,7 +256,8 @@ fn conflicting_ordered_episodes_are_skipped_without_losing_parents_or_orders() {
                 json!({"status":"success","data":{"series":{"id":70600},"episodes":final_page},"links":{"next":null}}),
             ),
         ]);
-        let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
+        let mut provider =
+            Tvdb::with_endpoint("fixture".into(), None, Tvdb::DOMAINS, &endpoint).unwrap();
         let snapshot = provider.fetch("series:70600").unwrap().unwrap();
         assert_eq!(snapshot["series"], series);
         let expected = match case {
@@ -129,8 +266,7 @@ fn conflicting_ordered_episodes_are_skipped_without_losing_parents_or_orders() {
             _ => json!([unique_episode]),
         };
         assert_eq!(
-            snapshot["episode_orders"][order],
-            expected,
+            snapshot["episode_orders"][order], expected,
             "order={order}, case={case}, same_page={same_page}, reversed={reversed}"
         );
         handle.join().unwrap();
@@ -154,7 +290,8 @@ fn incomplete_order_pages_fail_the_series_acquisition() {
             json!({"status":"success","data":{"series":{"id":1},"episodes":[]}}),
         ),
     ]);
-    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
+    let mut provider =
+        Tvdb::with_endpoint("fixture".into(), None, Tvdb::DOMAINS, &endpoint).unwrap();
     assert_eq!(
         provider.fetch("series:1").unwrap_err().to_string(),
         "Missing TVDB pagination links"
@@ -178,10 +315,9 @@ fn series_sync_refreshes_order_snapshots_for_child_updates() {
             json!({"status":"success","data":{"id":20,"seriesId":2}}),
         ),
     ]);
-    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
-    provider.select_domain("series");
+    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &["series"], &endpoint).unwrap();
     let page = provider
-        .discover_changes(100000, &Value::Null, 200000)
+        .discover(Operation::Sync, Some(100000), &Value::Null, 200000)
         .unwrap();
     assert!(matches!(&page.changes[0], Change::Dirty(key) if key == "series:1"));
     assert!(matches!(&page.changes[1], Change::Dirty(key) if key == "series:2"));
@@ -209,18 +345,17 @@ fn season_type_changes_refresh_all_series_then_resume_updates() {
             json!({"status":"success","data":[{"recordType":"series","recordId":3,"methodInt":3}],"links":{"next":null}}),
         ),
     ]);
-    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
-    provider.select_domain("series");
+    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &["series"], &endpoint).unwrap();
     let first = provider
-        .discover_changes(100000, &Value::Null, 200000)
+        .discover(Operation::Sync, Some(100000), &Value::Null, 200000)
         .unwrap();
     assert!(matches!(&first.changes[0], Change::Dirty(key) if key == "series:1"));
     let second = provider
-        .discover_changes(100000, &first.next.unwrap(), 200000)
+        .discover(Operation::Sync, Some(100000), &first.next.unwrap(), 200000)
         .unwrap();
     assert!(matches!(&second.changes[0], Change::Dirty(key) if key == "series:2"));
     let last = provider
-        .discover_changes(100000, &second.next.unwrap(), 200000)
+        .discover(Operation::Sync, Some(100000), &second.next.unwrap(), 200000)
         .unwrap();
     assert!(matches!(&last.changes[0], Change::Deleted {key, ..} if key == "series:3"));
     assert!(last.next.is_none());
@@ -244,13 +379,16 @@ fn multi_domain_updates_refresh_series_without_losing_child_events() {
             json!({"status":"success","data":{"id":20,"seriesId":2}}),
         ),
     ]);
-    let provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
-    let mut plan = trakkin_mappings_ingestion::dataset::AcquisitionPlan::new(
-        Box::new(provider),
+    let mut provider = Tvdb::with_endpoint(
+        "fixture".into(),
+        None,
         &["series", "season", "episode"],
+        &endpoint,
     )
     .unwrap();
-    let page = plan.discover_changes(100000, &Value::Null, 200000).unwrap();
+    let page = provider
+        .discover(Operation::Sync, Some(100000), &Value::Null, 200000)
+        .unwrap();
     assert!(
         page.changes
             .iter()
@@ -297,13 +435,15 @@ fn child_catalogues_fetch_extended_records_and_preserve_deletions() {
                 json!({"status":"success","data":[{"recordType":path,"recordId":12,"methodInt":3}],"links":{"next":null}}),
             ),
         ]);
-        let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
-        provider.select_domain(domain);
-        let page = provider.enumerate(&Value::Null, 0).unwrap();
+        let mut provider =
+            Tvdb::with_endpoint("fixture".into(), None, &[domain], &endpoint).unwrap();
+        let page = provider
+            .discover(Operation::Bootstrap, None, &Value::Null, 0)
+            .unwrap();
         assert!(matches!(&page.changes[0], Change::Dirty(key) if key == &format!("{domain}:12")));
         assert!(
             provider
-                .enumerate(&page.next.unwrap(), 0)
+                .discover(Operation::Bootstrap, None, &page.next.unwrap(), 0)
                 .unwrap()
                 .next
                 .is_none()
@@ -313,7 +453,7 @@ fn child_catalogues_fetch_extended_records_and_preserve_deletions() {
             1
         );
         let page = provider
-            .discover_changes(100000, &Value::Null, 200000)
+            .discover(Operation::Sync, Some(100000), &Value::Null, 200000)
             .unwrap();
         assert!(
             matches!(&page.changes[0], Change::Deleted {key, ..} if key == &format!("{domain}:12"))
@@ -341,10 +481,8 @@ fn detail_batches_overlap_under_the_shared_request_limiter() {
         );
         let (mut first, _) = listener.accept().unwrap();
         let first_request = common::read_request(&mut first);
-        let started = Instant::now();
         let (mut second, _) = listener.accept().unwrap();
         let second_request = common::read_request(&mut second);
-        assert!(started.elapsed() >= Duration::from_millis(20));
         for (stream, request) in [(&mut first, first_request), (&mut second, second_request)] {
             let record_id = if request.contains("/episodes/1/") {
                 1
@@ -358,7 +496,9 @@ fn detail_batches_overlap_under_the_shared_request_limiter() {
             );
         }
     });
-    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
+    let mut provider =
+        Tvdb::with_endpoint("fixture".into(), None, Tvdb::DOMAINS, &endpoint).unwrap();
+    let started = Instant::now();
     assert_eq!(
         provider
             .fetch_many(&["episode:1".into(), "episode:2".into()])
@@ -366,6 +506,7 @@ fn detail_batches_overlap_under_the_shared_request_limiter() {
             .len(),
         2
     );
+    assert!(started.elapsed() >= Duration::from_millis(20));
     handle.join().unwrap();
 }
 
@@ -382,16 +523,17 @@ fn preserves_merges_and_follows_next_page_without_following_its_host() {
             json!({"status":"success","data":[],"links":{"next":null}}),
         ),
     ]);
-    let mut provider = Tvdb::with_endpoint("fixture".into(), None, &endpoint).unwrap();
+    let mut provider =
+        Tvdb::with_endpoint("fixture".into(), None, Tvdb::DOMAINS, &endpoint).unwrap();
     let page = provider
-        .discover_changes(200000, &Value::Null, 300000)
+        .discover(Operation::Sync, Some(200000), &Value::Null, 300000)
         .unwrap();
     assert!(
         matches!(&page.changes[0],Change::Deleted { key, metadata } if key == "series:1" && metadata["mergeToId"] == 2)
     );
     assert!(matches!(&page.changes[1],Change::Dirty(key) if key == "series:2"));
     let end = provider
-        .discover_changes(200000, &page.next.unwrap(), 300000)
+        .discover(Operation::Sync, Some(200000), &page.next.unwrap(), 300000)
         .unwrap();
     assert!(end.next.is_none());
     handle.join().unwrap();

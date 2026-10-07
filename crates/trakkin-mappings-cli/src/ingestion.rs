@@ -6,7 +6,7 @@ use std::{fs::OpenOptions, path::PathBuf};
 use trakkin_mappings_ingestion::{
     Operation, Provider,
     providers::{AniList, Tmdb, Tvdb},
-    storage::{Paimon, RoutedStorage, Storage},
+    storage::{PaimonBridge, RoutedStorage, Storage},
 };
 
 #[derive(Args)]
@@ -53,17 +53,41 @@ impl Source {
             Self::Tvdb => "com.thetvdb",
         }
     }
-    fn open(self) -> Result<Box<dyn Provider>> {
+    fn domains(self, selected: Option<&str>) -> Result<Vec<&'static str>> {
+        let domains = match self {
+            Self::Anilist => AniList::DOMAINS,
+            Self::Tmdb => Tmdb::DOMAINS,
+            Self::Tvdb => Tvdb::DOMAINS,
+        };
+        let Some(selected) = selected else {
+            return Ok(domains.to_vec());
+        };
+        let domain = domains
+            .iter()
+            .copied()
+            .find(|domain| *domain == selected)
+            .with_context(|| {
+                format!(
+                    "Unsupported domain {selected} for {}; choose {}",
+                    self.name(),
+                    domains.join(", ")
+                )
+            })?;
+        Ok(vec![domain])
+    }
+    fn open(self, domains: &[&str]) -> Result<Box<dyn Provider>> {
         Ok(match self {
             Self::Anilist => Box::new(AniList::new()?),
             Self::Tmdb => Box::new(Tmdb::new(
                 std::env::var("TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN")
                     .context("Set TRAKKIN_MAPPINGS_INGESTION_TMDB_TOKEN")?,
+                domains,
             )?),
             Self::Tvdb => Box::new(Tvdb::new(
                 std::env::var("TRAKKIN_MAPPINGS_INGESTION_TVDB_API_KEY")
                     .context("Set TRAKKIN_MAPPINGS_INGESTION_TVDB_API_KEY")?,
                 std::env::var("TRAKKIN_MAPPINGS_INGESTION_TVDB_PIN").ok(),
+                domains,
             )?),
         })
     }
@@ -102,10 +126,7 @@ impl Command {
             .or_else(|| std::env::var("TRAKKIN_MAPPINGS_INGESTION_WAREHOUSE").ok())
             .context("Set --warehouse or TRAKKIN_MAPPINGS_INGESTION_WAREHOUSE")?;
         let provider = self.provider.context("Set --provider")?;
-        let domains = trakkin_mappings_ingestion::dataset::select_domains(
-            provider.name(),
-            self.domain.as_deref(),
-        )?;
+        let domains = provider.domains(self.domain.as_deref())?;
         let warehouses = domains
             .iter()
             .map(|domain| {
@@ -144,6 +165,7 @@ impl Command {
             provider.name(),
             &domains,
         )?;
+        let bridge = PaimonBridge::start(&self.bridge)?;
         if let Some(operation) = match self.operation {
             Action::Bootstrap => Some(Operation::Bootstrap),
             Action::Sync => Some(Operation::Sync),
@@ -152,21 +174,16 @@ impl Command {
         } {
             let progress = LiveProgress::new(provider.name(), &domains.join("+"));
             progress.0.set_message("opening acquisition job");
-            let coordinator = Paimon::open(&self.bridge, &job_warehouse)?;
+            let coordinator = bridge.open(&job_warehouse)?;
             let datasets = domains
                 .iter()
                 .zip(&warehouses)
-                .map(|(domain, warehouse)| {
-                    Ok(((*domain).to_owned(), Paimon::open(&self.bridge, warehouse)?))
-                })
+                .map(|(domain, warehouse)| Ok(((*domain).to_owned(), bridge.open(warehouse)?)))
                 .collect::<Result<_>>()?;
             let mut storage = RoutedStorage::new(coordinator, datasets)?;
-            let mut plan = trakkin_mappings_ingestion::dataset::AcquisitionPlan::new(
-                provider.open()?,
-                &domains,
-            )?;
+            let mut upstream = provider.open(&domains)?;
             let report = trakkin_mappings_ingestion::run(
-                &mut plan,
+                &mut *upstream,
                 &mut storage,
                 operation,
                 self.batch_size as usize,
@@ -180,7 +197,7 @@ impl Command {
             )?;
             let mut snapshots = serde_json::Map::new();
             for (domain, dataset) in storage.datasets_mut() {
-                snapshots.insert(domain.clone(), dataset.snapshot_id()?);
+                snapshots.insert(domain.clone(), serde_json::json!(dataset.snapshot_id()?));
             }
             progress.0.finish_and_clear();
             println!(
@@ -189,7 +206,7 @@ impl Command {
             );
             return Ok(());
         }
-        let mut coordinator = Paimon::open_existing(&self.bridge, &job_warehouse)?;
+        let mut coordinator = bridge.open_existing(&job_warehouse)?;
         match self.operation {
             Action::Validate => coordinator.validate()?,
             Action::Maintain => {
@@ -201,7 +218,7 @@ impl Command {
         for (domain, warehouse) in domains.iter().zip(&warehouses) {
             let progress = LiveProgress::new(provider.name(), domain);
             progress.0.set_message("opening storage");
-            let mut storage = Paimon::open_existing(&self.bridge, warehouse)?;
+            let mut storage = bridge.open_existing(warehouse)?;
             match &self.operation {
                 Action::Inspect {
                     key,
@@ -212,11 +229,12 @@ impl Command {
                     let records =
                         storage.inspect(key.as_deref(), *limit as usize, *include_deleted)?;
                     let mut checkpoints = serde_json::Map::new();
-                    for operation in ["bootstrap", "sync", "reconcile"] {
-                        checkpoints.insert(operation.into(), coordinator.checkpoint(operation)?);
+                    for operation in Operation::ALL {
+                        checkpoints
+                            .insert(operation.name().into(), coordinator.checkpoint(operation)?);
                     }
                     let mut result = serde_json::json!({"provider":provider.name(),"domain":domain,"records":records,"checkpoints":checkpoints});
-                    result["snapshot_id"] = storage.snapshot_id()?;
+                    result["snapshot_id"] = serde_json::json!(storage.snapshot_id()?);
                     if *summary {
                         let index = storage.index()?;
                         let deleted = index.values().filter(|entry| entry.deleted).count();
@@ -294,11 +312,7 @@ mod tests {
         let source = arguments.command.provider.unwrap();
         assert_eq!(source.name(), "com.thetvdb");
         assert_eq!(
-            trakkin_mappings_ingestion::dataset::select_domains(
-                source.name(),
-                arguments.command.domain.as_deref()
-            )
-            .unwrap(),
+            source.domains(arguments.command.domain.as_deref()).unwrap(),
             vec!["movie", "series", "season", "episode"]
         );
         let arguments = Arguments::try_parse_from([
@@ -311,5 +325,11 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(arguments.command.domain.as_deref(), Some("series"));
+        assert_eq!(
+            Source::Tvdb.domains(Some("series")).unwrap(),
+            vec!["series"]
+        );
+        assert!(Source::Tvdb.domains(Some("tv")).is_err());
+        assert!(Source::Anilist.domains(Some("../media")).is_err());
     }
 }
