@@ -311,10 +311,16 @@ A canonical mapping statement:
 - uses exactly one ASCII space around a mapping operator;
 - uses exactly one ASCII space around `::`;
 - contains no unnecessary spaces inside selectors or composites;
-- sorts unordered set values deterministically; and
+- sorts unordered set values deterministically;
 - divides all statement extents by their greatest common divisor;
 - omits `@1`; and
 - formats equivalent expressions identically.
+
+The sides of symmetric `<=>` and `<~>` statements MUST be serialized in
+lexical order of their canonical expressions. Reversing their authored
+orientation MUST NOT change claim identity. Directional `=>` statements
+MUST preserve their orientation. Composite member order and ordered-range
+direction MUST remain unchanged.
 
 For example:
 

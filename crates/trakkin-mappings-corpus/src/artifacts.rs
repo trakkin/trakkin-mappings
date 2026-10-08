@@ -35,7 +35,7 @@ fn index_unlocked(root: &Path, database: &Path, adapters: &Adapters) -> Result<I
         adapters.fingerprint().as_bytes(),
         include_bytes!("../../../Cargo.toml"),
         include_bytes!("../../../Cargo.lock"),
-        include_bytes!("../../../grammar/Trakkin.g4"),
+        include_bytes!("../../trakkin-mappings-language/grammar/Trakkin.g4"),
         include_bytes!("../../trakkin-mappings-language/Cargo.toml"),
         include_bytes!("../../trakkin-mappings-language/build.rs"),
         include_bytes!("../../trakkin-mappings-language/src/lib.rs"),
