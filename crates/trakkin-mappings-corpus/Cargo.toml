@@ -1,0 +1,34 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "trakkin-mappings-corpus"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["pipeline"]
+pipeline = ["dep:postgres", "dep:postgres-native-tls", "dep:native-tls", "dep:unicode-normalization", "dep:chrono"]
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, optional = true }
+fs2.workspace = true
+native-tls = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+unicode-normalization = { workspace = true, optional = true }
+trakkin-mappings-language.workspace = true
+
+[dev-dependencies]
+trakkin-mappings-source.workspace = true
+trakkin-mappings-test-support.workspace = true
