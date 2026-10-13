@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/trakkin-mappings-cli",
   "crates/trakkin-mappings-corpus",
   "crates/trakkin-mappings-language",
   "crates/trakkin-mappings-source",
