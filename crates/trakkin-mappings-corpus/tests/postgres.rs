@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 use trakkin_mappings_corpus::{
-    git::Repository,
+    git::History,
     pipeline::{Action, Database, Review},
 };
 use trakkin_mappings_source::storage::{Batch, Commit, Postgres, Update};
@@ -23,6 +23,112 @@ fn commit(store: &mut Postgres, updates: BTreeMap<String, Update>) {
 
 fn movie(id: u64, imdb: &str) -> Update {
     Update::record(&json!({"id":id,"title":"A Film", "release_date":"2020-01-01", "external_ids":{"imdb_id":imdb}}), json!({})).unwrap()
+}
+
+#[test]
+fn retention_preserves_accepted_and_rejected_review_evidence_after_retraction() {
+    let fixture = Fixture::start();
+    let url = fixture.url.as_str();
+    let mut source = Postgres::connect(url, "org.themoviedb", &["movie"]).unwrap();
+    source.begin().unwrap();
+    commit(
+        &mut source,
+        (1..=3)
+            .map(|id| (format!("movie:{id}"), movie(id, &format!("tt{id}"))))
+            .collect(),
+    );
+    let mut database = Database::connect(url).unwrap();
+    database.sync(100, None).unwrap();
+    let candidates = database.candidates(None, 100).unwrap();
+    let mut inspection = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let engine: String = inspection
+        .query_one("SELECT revision FROM corpus.engine", &[])
+        .unwrap()
+        .get(0);
+    let mut reviewed = Vec::new();
+    for (id, action) in [(1, Action::Accepted), (2, Action::Rejected)] {
+        let claim_id = trakkin_mappings_corpus::parse_record(&format!(
+            "org.themoviedb://movie/{id} <=> com.imdb://title/tt{id}"
+        ))
+        .unwrap()
+        .statement
+        .claim_id()
+        .to_string();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.claim_id == claim_id)
+            .unwrap();
+        let version = database
+            .review(Review {
+                record: candidate.record.clone(),
+                action,
+                note: format!("Reviewed fixture {id}"),
+                expected_candidate: Some(candidate.revision),
+                expected_decision: None,
+                replaces: None,
+            })
+            .unwrap();
+        let evidence: Value = inspection
+            .query_one(
+                "SELECT evidence FROM corpus.decision_inputs WHERE version=$1",
+                &[&version],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(evidence["supports"][0]["method"], "explicit-identifier");
+        assert_eq!(evidence["supports"][0]["engine"], engine);
+        assert!(evidence["supports"][0]["id"].as_str().is_some());
+        assert!(evidence["supports"][0]["evidence"].is_array());
+        reviewed.push((id, version, evidence));
+        if action == Action::Accepted {
+            database
+                .review(Review {
+                    record: candidate.record.clone(),
+                    action: Action::Retracted,
+                    note: "Retracted without erasing the original review".into(),
+                    expected_candidate: None,
+                    expected_decision: Some(version),
+                    replaces: None,
+                })
+                .unwrap();
+        }
+    }
+    commit(
+        &mut source,
+        (1..=3)
+            .map(|id| (format!("movie:{id}"), movie(id, &format!("tt{}", id + 100))))
+            .collect(),
+    );
+    database.sync(100, None).unwrap();
+    assert_eq!(
+        inspection
+            .query_one(
+                "SELECT count(*) FROM corpus.support_inputs WHERE revision=1",
+                &[]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    inspection
+        .execute(
+            "UPDATE ingestion.record_versions SET recorded_at=clock_timestamp()-interval '40 days' WHERE revision=1",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(database.retain(30, 1, 1000).unwrap().versions, 1);
+    for (id, version, evidence) in reviewed {
+        let row = inspection
+            .query_one(
+                "SELECT i.evidence,v.payload,d.note FROM corpus.decision_inputs i JOIN ingestion.record_versions v USING(source,revision,key) JOIN corpus.decision_events d ON d.version=i.version WHERE i.version=$1",
+                &[&version],
+            )
+            .unwrap();
+        assert_eq!(row.get::<_, Value>(0), evidence);
+        let payload: Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap();
+        assert_eq!(payload["external_ids"]["imdb_id"], format!("tt{id}"));
+        assert_eq!(row.get::<_, String>(2), format!("Reviewed fixture {id}"));
+    }
 }
 
 #[test]
@@ -134,17 +240,20 @@ fn structural_candidates_align_ranges_in_the_declared_default_order() {
     let temporary = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let repository = runtime
-        .block_on(Repository::publication(
-            &temporary.path().join("structural.git"),
-        ))
+        .block_on(History::open(&temporary.path().join("structural.git")))
         .unwrap();
     database.publish(&repository, &runtime, 10).unwrap();
     let published = runtime.block_on(repository.head()).unwrap();
-    let changes = runtime
-        .block_on(repository.changes(None, &published, None, 100))
-        .unwrap();
+    let changes = runtime.block_on(async {
+        repository
+            .delta(None, &published)
+            .await
+            .unwrap()
+            .next_batch(100)
+            .await
+            .unwrap()
+    });
     let artifact = changes
-        .changes
         .iter()
         .filter(|change| change.path != trakkin_mappings_corpus::POLICY)
         .map(|change| {
@@ -205,11 +314,16 @@ fn structural_candidates_align_ranges_in_the_declared_default_order() {
     assert_eq!(database.status().unwrap()["diagnostics"], json!([]));
     database.publish(&repository, &runtime, 10).unwrap();
     let head = runtime.block_on(repository.head()).unwrap();
-    let changes = runtime
-        .block_on(repository.changes(None, &head, None, 100))
-        .unwrap();
+    let changes = runtime.block_on(async {
+        repository
+            .delta(None, &head)
+            .await
+            .unwrap()
+            .next_batch(100)
+            .await
+            .unwrap()
+    });
     let artifact = changes
-        .changes
         .iter()
         .filter(|change| change.path != trakkin_mappings_corpus::POLICY)
         .map(|change| {
@@ -372,7 +486,7 @@ fn restored_database_recovers_pending_publication_after_git_cache_loss() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("publication.git");
-    let repository = runtime.block_on(Repository::publication(&path)).unwrap();
+    let repository = runtime.block_on(History::open(&path)).unwrap();
     let pending = database
         .prepare_publication(&repository, &runtime, 100)
         .unwrap()
@@ -394,7 +508,7 @@ fn restored_database_recovers_pending_publication_after_git_cache_loss() {
         Postgres::connect(restored.url.as_str(), "org.themoviedb", &["movie"]).unwrap();
     assert_eq!(source.revision().unwrap(), 1);
     assert!(source.get("movie:1").unwrap().is_some());
-    let repository = runtime.block_on(Repository::publication(&path)).unwrap();
+    let repository = runtime.block_on(History::open(&path)).unwrap();
     let published = database.publish(&repository, &runtime, 100).unwrap();
     assert_eq!(published.commit, Some(pending.prepared.commit.clone()));
     assert_eq!(
@@ -489,9 +603,7 @@ fn pipeline_rehearsal_reports_throughput_and_storage() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let repository = runtime
-        .block_on(Repository::publication(
-            &directory.path().join("publication.git"),
-        ))
+        .block_on(History::open(&directory.path().join("publication.git")))
         .unwrap();
     let publication_started = Instant::now();
     let publication = database.publish(&repository, &runtime, 250).unwrap();
@@ -597,9 +709,7 @@ fn corpus_recovers_bootstrap_replays_and_retracts_dependent_evidence() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let repository = runtime
-        .block_on(Repository::publication(
-            &directory.path().join("publication.git"),
-        ))
+        .block_on(History::open(&directory.path().join("publication.git")))
         .unwrap();
     let pending = database
         .prepare_publication(&repository, &runtime, 10)
@@ -734,15 +844,19 @@ fn corpus_recovers_bootstrap_replays_and_retracts_dependent_evidence() {
     database.sync(2, None).unwrap();
     database.publish(&repository, &runtime, 2).unwrap();
     let after = runtime.block_on(repository.head()).unwrap();
-    let delta = runtime
-        .block_on(repository.changes(Some(&before), &after, None, 1000))
-        .unwrap();
-    assert_eq!(delta.changes.len(), 1);
-    let artifact = trakkin_mappings_corpus::Artifact::parse(
-        &delta.changes[0].path,
-        delta.changes[0].text.as_deref().unwrap(),
-    )
-    .unwrap();
+    let delta = runtime.block_on(async {
+        repository
+            .delta(Some(&before), &after)
+            .await
+            .unwrap()
+            .next_batch(1000)
+            .await
+            .unwrap()
+    });
+    assert_eq!(delta.len(), 1);
+    let artifact =
+        trakkin_mappings_corpus::Artifact::parse(&delta[0].path, delta[0].text.as_deref().unwrap())
+            .unwrap();
     assert_eq!(artifact.record.statement.claim_id(), selector_id);
     assert_eq!(
         trakkin_mappings_corpus::Bindings::read(&artifact.record)
@@ -1026,9 +1140,7 @@ fn corpus_bounds_ambiguous_blocks_and_resumes_engine_reprojection() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let repository = runtime
-        .block_on(Repository::publication(
-            &directory.path().join("publication.git"),
-        ))
+        .block_on(History::open(&directory.path().join("publication.git")))
         .unwrap();
     database.publish(&repository, &runtime, 100).unwrap();
     inspection

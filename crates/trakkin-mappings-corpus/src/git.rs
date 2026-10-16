@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    ops::Deref,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -16,12 +17,41 @@ use tokio::{
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const FILE_LIMIT: usize = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const CACHE_APPLIED: &str = "refs/trakkin/applied";
+
+mod delta;
+pub use delta::Delta;
 
 #[derive(Clone, Debug)]
 pub struct Repository {
     path: PathBuf,
-    writable: bool,
-    bare: bool,
+    credentials: Credentials,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Credentials {
+    Public,
+    Publisher,
+}
+
+#[derive(Clone, Debug)]
+pub struct History(Repository);
+
+#[derive(Clone, Debug)]
+pub struct UpstreamCache(Repository);
+
+impl Deref for History {
+    type Target = Repository;
+    fn deref(&self) -> &Repository {
+        &self.0
+    }
+}
+
+impl Deref for UpstreamCache {
+    type Target = Repository;
+    fn deref(&self) -> &Repository {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -44,20 +74,10 @@ pub struct FileChange {
     pub text: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Page {
-    pub changes: Vec<FileChange>,
-    pub next: Option<String>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
     #[error("mapping repository revision changed")]
     RevisionChanged,
-    #[error("mapping repository has uncommitted changes; resolve them before writing")]
-    DirtyWorktree,
-    #[error("upstream mapping repositories are read-only")]
-    ReadOnly,
     #[error(transparent)]
     Operation(#[from] anyhow::Error),
 }
@@ -83,10 +103,10 @@ impl RepositoryStore {
     pub fn local_path(&self) -> PathBuf {
         self.root.join("local")
     }
-    pub async fn local(&self) -> Result<Repository> {
-        Repository::local(&self.local_path()).await
+    pub async fn local(&self) -> Result<History> {
+        History::open(&self.local_path()).await
     }
-    pub fn upstream(&self, id: &str) -> Result<Repository> {
+    pub fn upstream(&self, id: &str) -> Result<UpstreamCache> {
         ensure!(
             id != "local"
                 && !id.is_empty()
@@ -103,19 +123,17 @@ impl RepositoryStore {
                 "mapping cache must be a real directory"
             );
         }
-        Ok(Repository {
+        Ok(UpstreamCache(Repository {
             path,
-            writable: false,
-            bare: true,
-        })
+            credentials: Credentials::Public,
+        }))
     }
     pub async fn validate_upstream(&self, remote: &str, branch: &str) -> Result<String> {
         let remote = validate_remote(remote)?;
         validate_branch(branch)?;
         let repository = Repository {
             path: self.root.clone(),
-            writable: false,
-            bare: true,
+            credentials: Credentials::Public,
         };
         repository
             .run(
@@ -134,32 +152,22 @@ impl RepositoryStore {
                 repository.path.join("HEAD").is_file() && repository.path.join("objects").is_dir(),
                 "cache is not a bare Git repository"
             );
-            fs::remove_dir_all(repository.path)?;
+            fs::remove_dir_all(&repository.path)?;
         }
         Ok(())
     }
 }
 
-impl Repository {
-    pub async fn local(path: &Path) -> Result<Self> {
-        Self::open(path, false).await
-    }
-    pub async fn publication(path: &Path) -> Result<Self> {
-        Self::open(path, true).await
-    }
-    async fn open(path: &Path, bare: bool) -> Result<Self> {
+impl History {
+    pub async fn open(path: &Path) -> Result<Self> {
         if path.exists() {
             ensure!(
                 fs::symlink_metadata(path)?.is_dir(),
                 "repository must be a real directory"
             );
             ensure!(
-                if bare {
-                    path.join("HEAD").is_file() && path.join("objects").is_dir()
-                } else {
-                    fs::symlink_metadata(path.join(".git")).is_ok_and(|metadata| metadata.is_dir())
-                },
-                "existing directory is not the expected Git repository"
+                path.join("HEAD").is_file() && path.join("objects").is_dir(),
+                "existing directory is not a bare Git repository"
             );
         } else {
             let parent = path
@@ -170,16 +178,17 @@ impl Repository {
             let staging = tempfile::Builder::new()
                 .prefix(".mapping-init-")
                 .tempdir_in(parent)?;
-            let repository = Self {
+            let repository = Self(Repository {
                 path: staging.path().to_owned(),
-                writable: true,
-                bare,
-            };
-            let mut arguments = vec!["init", "--template=", "--initial-branch=main"];
-            if bare {
-                arguments.push("--bare");
-            }
-            repository.run(&arguments, None, None).await?;
+                credentials: Credentials::Publisher,
+            });
+            repository
+                .run(
+                    &["init", "--bare", "--template=", "--initial-branch=main"],
+                    None,
+                    None,
+                )
+                .await?;
             let tree = repository.empty_tree().await?;
             let mut command = repository.command(
                 &["commit-tree", &tree, "-m", "Initialize mappings"],
@@ -195,15 +204,17 @@ impl Repository {
                 .await?;
             fs::rename(staging.path(), path).context("cannot finish repository initialization")?;
         }
-        let repository = Self {
+        let repository = Self(Repository {
             path: path.canonicalize()?,
-            writable: true,
-            bare,
-        };
+            credentials: Credentials::Publisher,
+        });
         repository.safe_config().await?;
         repository.head().await?;
         Ok(repository)
     }
+}
+
+impl Repository {
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -261,17 +272,7 @@ impl Repository {
         )
     }
 
-    pub async fn changes(
-        &self,
-        base: Option<&str>,
-        commit: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Page> {
-        ensure!(
-            (1..=1000).contains(&limit),
-            "Git page size must be between 1 and 1000"
-        );
+    pub async fn delta(&self, base: Option<&str>, commit: &str) -> Result<Delta> {
         validate_commit(commit)?;
         let base = if let Some(base) = base {
             validate_commit(base)?;
@@ -279,186 +280,21 @@ impl Repository {
         } else {
             self.empty_tree().await?
         };
-        let mut child = self
-            .command(
-                &[
-                    "diff-tree",
-                    "-r",
-                    "--no-commit-id",
-                    "--raw",
-                    "-z",
-                    "--no-renames",
-                    "--no-abbrev",
-                    &base,
-                    commit,
-                    "--",
-                    "mappings",
-                ],
-                None,
-                None,
-            )?
-            .spawn()?;
-        let stdout = child.stdout.take().context("Git output unavailable")?;
-        let stderr = child.stderr.take().context("Git diagnostics unavailable")?;
-        let read = async {
-            let mut reader = BufReader::new(stdout);
-            let mut entries = Vec::new();
-            let mut header = Vec::new();
-            let mut path = Vec::new();
-            loop {
-                header.clear();
-                if (&mut reader).take(257).read_until(0, &mut header).await? == 0 {
-                    break;
-                }
-                path.clear();
-                ensure!(
-                    (&mut reader).take(4097).read_until(0, &mut path).await? > 0,
-                    "incomplete Git delta"
-                );
-                ensure!(
-                    header.len() <= 256 && path.len() <= 4096,
-                    "invalid Git delta entry"
-                );
-                let path =
-                    std::str::from_utf8(path.strip_suffix(&[0]).context("invalid Git path")?)?;
-                if after.is_some_and(|after| path <= after) {
-                    continue;
-                }
-                validate_path(path)?;
-                let fields = std::str::from_utf8(
-                    header
-                        .strip_suffix(&[0])
-                        .context("invalid Git delta header")?,
-                )?
-                .split_whitespace()
-                .collect::<Vec<_>>();
-                ensure!(
-                    fields.len() == 5
-                        && matches!(fields[0], ":000000" | ":100644")
-                        && matches!(fields[1], "000000" | "100644"),
-                    "mapping entries must be regular non-executable files"
-                );
-                entries.push((
-                    path.to_owned(),
-                    (fields[1] != "000000").then(|| fields[3].to_owned()),
-                ));
-                if entries.len() > limit {
-                    break;
-                }
-            }
-            Ok::<_, anyhow::Error>(entries)
-        };
-        let entries_result = tokio::time::timeout(COMMAND_TIMEOUT, read).await;
-        let stopped_early = !matches!(&entries_result,Ok(Ok(entries)) if entries.len()<=limit);
-        if stopped_early {
-            let _ = child.kill().await;
-        }
-        let status = tokio::time::timeout(COMMAND_TIMEOUT, child.wait())
-            .await
-            .context("Git delta did not exit")??;
-        let diagnostics = read_output(stderr).await?;
-        let mut entries = entries_result.context("Git delta timed out")??;
-        ensure!(
-            stopped_early || status.success(),
-            "Git delta exited unsuccessfully"
-        );
-        ensure!(
-            diagnostics.is_empty(),
-            "Git delta failed: {}",
-            String::from_utf8_lossy(&diagnostics)
-        );
-        let mut more = entries.len() > limit;
-        entries.truncate(limit);
-        let request = entries
-            .iter()
-            .filter_map(|(_, object)| object.as_ref())
-            .map(|object| format!("{object}\n"))
-            .collect::<String>();
-        let sizes = self
-            .text(
-                &["cat-file", "--batch-check"],
-                Some(request.as_bytes()),
-                None,
-            )
-            .await?;
-        let mut sizes = sizes.lines();
-        let mut total = 0;
-        let mut keep = 0;
-        for (_, object) in &entries {
-            if let Some(object) = object {
-                let fields = sizes
-                    .next()
-                    .context("missing blob header")?
-                    .split_whitespace()
-                    .collect::<Vec<_>>();
-                ensure!(
-                    fields.len() == 3 && fields[0] == object && fields[1] == "blob",
-                    "invalid mapping blob"
-                );
-                let size: usize = fields[2].parse()?;
-                ensure!(size <= FILE_LIMIT, "mapping file exceeds 2 MiB");
-                if total + size + 256 > OUTPUT_LIMIT {
-                    more = true;
-                    break;
-                }
-                total += size + 256;
-            }
-            keep += 1;
-        }
-        entries.truncate(keep);
-        let request = entries
-            .iter()
-            .filter_map(|(_, object)| object.as_ref())
-            .map(|object| format!("{object}\n"))
-            .collect::<String>();
-        let output = self
-            .run(&["cat-file", "--batch"], Some(request.as_bytes()), None)
-            .await?;
-        let mut remaining = output.as_slice();
-        let mut changes = Vec::new();
-        for (path, object) in entries {
-            let text = if let Some(object) = object {
-                let boundary = remaining
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .context("missing blob header")?;
-                let fields = std::str::from_utf8(&remaining[..boundary])?
-                    .split_whitespace()
-                    .collect::<Vec<_>>();
-                ensure!(
-                    fields.len() == 3 && fields[0] == object && fields[1] == "blob",
-                    "inconsistent blob header"
-                );
-                let size: usize = fields[2].parse()?;
-                remaining = &remaining[boundary + 1..];
-                ensure!(
-                    remaining.len() > size && remaining[size] == b'\n',
-                    "inconsistent blob size"
-                );
-                let text = std::str::from_utf8(&remaining[..size])?.to_owned();
-                remaining = &remaining[size + 1..];
-                validate_file(&path, &text)?;
-                Some(text)
-            } else {
-                None
-            };
-            changes.push(FileChange { path, text });
-        }
-        ensure!(remaining.is_empty(), "unexpected blob output");
-        let next = if more {
-            Some(changes.last().context("empty Git page")?.path.clone())
-        } else {
-            None
-        };
-        Ok(Page { changes, next })
+        Delta::open(self, &base, commit)
     }
+}
 
-    pub async fn fetch(&self, remote: &str, branch: &str) -> Result<String> {
+impl UpstreamCache {
+    pub async fn fetch(&self, remote: &str, branch: &str, applied: Option<&str>) -> Result<String> {
         let remote = validate_remote(remote)?;
-        self.fetch_validated(&remote, branch).await
+        self.fetch_validated(&remote, branch, applied).await
     }
-    async fn fetch_validated(&self, remote: &str, branch: &str) -> Result<String> {
-        ensure!(!self.writable, "local repositories cannot fetch upstreams");
+    async fn fetch_validated(
+        &self,
+        remote: &str,
+        branch: &str,
+        applied: Option<&str>,
+    ) -> Result<String> {
         validate_branch(branch)?;
         let _guard = self.lock()?;
         self.run(
@@ -492,10 +328,9 @@ impl Repository {
             let staging = tempfile::Builder::new()
                 .prefix(".mapping-fetch-init-")
                 .tempdir_in(self.path.parent().context("cache has no parent")?)?;
-            let initializing = Self {
+            let initializing = Repository {
                 path: staging.path().to_owned(),
-                writable: false,
-                bare: true,
+                credentials: Credentials::Public,
             };
             initializing
                 .run(
@@ -517,6 +352,15 @@ impl Repository {
                 .context("cannot finish upstream cache initialization")?;
         }
         self.safe_config().await?;
+        if let Some(applied) = applied
+            && self.contains_commit(applied).await?
+        {
+            self.run(&["update-ref", CACHE_APPLIED, applied], None, None)
+                .await?;
+        } else {
+            self.run(&["update-ref", "-d", CACHE_APPLIED], None, None)
+                .await?;
+        }
         self.run(
             &[
                 "fetch",
@@ -526,6 +370,19 @@ impl Repository {
                 "--depth=1",
                 remote,
                 &format!("+refs/heads/{branch}:refs/trakkin/incoming"),
+            ],
+            None,
+            None,
+        )
+        .await?;
+        self.run(
+            &[
+                "-c",
+                "gc.auto=6700",
+                "-c",
+                "gc.autoDetach=false",
+                "gc",
+                "--auto",
             ],
             None,
             None,
@@ -541,21 +398,9 @@ impl Repository {
             .trim()
             .to_owned())
     }
-    pub async fn pin(&self, commit: &str) -> Result<()> {
-        validate_commit(commit)?;
-        self.run(
-            &[
-                "update-ref",
-                &format!("refs/trakkin/applied/{commit}"),
-                commit,
-            ],
-            None,
-            None,
-        )
-        .await?;
-        Ok(())
-    }
+}
 
+impl History {
     pub async fn publication_remote(&self, remote: &str, branch: &str) -> Result<Option<String>> {
         let remote = validate_remote(remote)?;
         self.publication_remote_validated(&remote, branch).await
@@ -565,10 +410,6 @@ impl Repository {
         remote: &str,
         branch: &str,
     ) -> Result<Option<String>> {
-        ensure!(
-            self.writable && self.bare,
-            "remote publication requires a managed bare repository"
-        );
         validate_branch(branch)?;
         self.run(
             &["check-ref-format", &format!("refs/heads/{branch}")],
@@ -649,10 +490,6 @@ impl Repository {
         ))
     }
     pub async fn follow_publication(&self, commit: &str) -> Result<()> {
-        ensure!(
-            self.writable && self.bare,
-            "only managed bare publication repositories can follow a remote"
-        );
         validate_commit(commit)?;
         let _guard = self.lock()?;
         self.run(
@@ -681,10 +518,6 @@ impl Repository {
         expected: Option<&str>,
         commit: &str,
     ) -> Result<()> {
-        ensure!(
-            self.writable && self.bare,
-            "remote publication requires a managed bare repository"
-        );
         validate_branch(branch)?;
         validate_commit(commit)?;
         if let Some(expected) = expected {
@@ -714,9 +547,6 @@ impl Repository {
         changes: &BTreeMap<String, Option<String>>,
         message: &str,
     ) -> Result<Prepared, WriteError> {
-        if !self.writable {
-            return Err(WriteError::ReadOnly);
-        }
         validate_commit(expected)?;
         if changes.len() > 1000 {
             return Err(anyhow::anyhow!("publication batch exceeds 1000 files").into());
@@ -725,7 +555,7 @@ impl Repository {
         if self.head().await? != expected {
             return Err(WriteError::RevisionChanged);
         }
-        self.require_clean().await?;
+        self.safe_config().await?;
         let seconds = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .context("system clock precedes Unix epoch")?
@@ -734,7 +564,12 @@ impl Repository {
         let commit = self
             .create_commit(expected, changes, message, &date)
             .await?;
-        self.pin(&commit).await?;
+        self.run(
+            &["update-ref", "refs/trakkin/prepared", &commit],
+            None,
+            None,
+        )
+        .await?;
         Ok(Prepared {
             base: expected.to_owned(),
             commit,
@@ -833,14 +668,16 @@ impl Repository {
                 commit == prepared.commit,
                 "stored publication does not reproduce its commit"
             );
-            self.pin(&commit).await?;
+            self.run(
+                &["update-ref", "refs/trakkin/prepared", &commit],
+                None,
+                None,
+            )
+            .await?;
         }
         Ok(())
     }
     pub async fn apply(&self, prepared: &Prepared) -> Result<(), WriteError> {
-        if !self.writable {
-            return Err(WriteError::ReadOnly);
-        }
         validate_commit(&prepared.base)?;
         validate_commit(&prepared.commit)?;
         self.restore(prepared).await?;
@@ -850,7 +687,7 @@ impl Repository {
             return Err(WriteError::RevisionChanged);
         }
         if current == prepared.base {
-            self.require_clean().await?;
+            self.safe_config().await?;
             self.run(
                 &["update-ref", "HEAD", &prepared.commit, &prepared.base],
                 None,
@@ -858,69 +695,13 @@ impl Repository {
             )
             .await?;
         }
-        if !self.bare && prepared.base != prepared.commit {
-            let index = self.text(&["write-tree"], None, None).await?;
-            let desired = self
-                .text(
-                    &["rev-parse", &format!("{}^{{tree}}", prepared.commit)],
-                    None,
-                    None,
-                )
-                .await?;
-            if index != desired {
-                let old = self
-                    .text(
-                        &["rev-parse", &format!("{}^{{tree}}", prepared.base)],
-                        None,
-                        None,
-                    )
-                    .await?;
-                if index != old
-                    || self
-                        .run(&["diff-files", "--quiet"], None, None)
-                        .await
-                        .is_err()
-                {
-                    return Err(WriteError::DirtyWorktree);
-                }
-                self.run(
-                    &["read-tree", "-u", "-m", &prepared.base, &prepared.commit],
-                    None,
-                    None,
-                )
-                .await?;
-            }
-        }
         Ok(())
     }
-    async fn require_clean(&self) -> Result<(), WriteError> {
-        self.safe_config().await?;
-        if !self.bare
-            && !self
-                .run(
-                    &[
-                        "status",
-                        "--porcelain=v1",
-                        "-z",
-                        "--untracked-files=all",
-                        "--ignored=matching",
-                    ],
-                    None,
-                    None,
-                )
-                .await?
-                .is_empty()
-        {
-            return Err(WriteError::DirtyWorktree);
-        }
-        Ok(())
-    }
+}
+
+impl Repository {
     fn lock(&self) -> Result<RepositoryLock> {
-        let path = if self.bare {
-            self.path.with_extension("git.lock")
-        } else {
-            self.path.join(".git/trakkin-write.lock")
-        };
+        let path = self.path.with_extension("git.lock");
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -969,8 +750,7 @@ impl Repository {
         {
             command.env_remove(key);
         }
-        if self.writable
-            && self.bare
+        if matches!(self.credentials, Credentials::Publisher)
             && let Ok(authorization) = std::env::var("TRAKKIN_MAPPINGS_GIT_AUTHORIZATION")
         {
             command
@@ -1173,9 +953,193 @@ mod tests {
     use crate::parse_record;
 
     #[tokio::test]
+    async fn delta_streams_bounded_batches_without_restarting() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = History::open(&directory.path().join("history.git"))
+            .await
+            .unwrap();
+        let mut expected = BTreeMap::new();
+        let mut artifacts = (0..1010)
+            .map(|number| Artifact {
+                record: parse_record(&format!("a://{number} <=> b://{number}")).unwrap(),
+                rejected: false,
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by_key(Artifact::path);
+        for (number, mut artifact) in artifacts.into_iter().enumerate() {
+            if number < 20 {
+                artifact
+                    .record
+                    .metadata
+                    .push(format!("#@note {}", "x".repeat(1800 * 1024)));
+            }
+            expected.insert(artifact.path(), Some(artifact.text()));
+        }
+        let entries = expected.clone().into_iter().collect::<Vec<_>>();
+        for chunk in entries.chunks(1000) {
+            let prepared = repository
+                .prepare(
+                    &repository.head().await.unwrap(),
+                    &chunk.iter().cloned().collect(),
+                    "Fixture batch",
+                )
+                .await
+                .unwrap();
+            repository.apply(&prepared).await.unwrap();
+        }
+        let mut delta = repository
+            .delta(None, &repository.head().await.unwrap())
+            .await
+            .unwrap();
+        let mut observed = BTreeMap::new();
+        let mut paths = Vec::new();
+        let mut limits = [1000, 8, 3].into_iter().cycle();
+        loop {
+            let limit = limits.next().unwrap();
+            let batch = delta.next_batch(limit).await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= limit);
+            assert!(
+                batch
+                    .iter()
+                    .filter_map(|change| change.text.as_ref())
+                    .map(String::len)
+                    .sum::<usize>()
+                    <= OUTPUT_LIMIT
+            );
+            for change in batch {
+                paths.push(change.path.clone());
+                assert!(observed.insert(change.path, change.text).is_none());
+            }
+        }
+        assert!(paths.iter().eq(expected.keys()));
+        assert_eq!(observed, expected);
+        let unchanged = repository
+            .prepare(
+                &repository.head().await.unwrap(),
+                &BTreeMap::new(),
+                "Reader released its lock",
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.commit, repository.head().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upstream_cache_bounds_pins_and_reclaims_expired_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let remote = History::open(&directory.path().join("remote.git"))
+            .await
+            .unwrap();
+        let store = RepositoryStore::open(&directory.path().join("consumer")).unwrap();
+        let cache = store.upstream("community").unwrap();
+        let mut commits = Vec::new();
+        let mut applied = None;
+        for number in 0..12 {
+            let artifact = Artifact {
+                record: parse_record(&format!("#@note Revision {number}\na://1 <=> b://1\n"))
+                    .unwrap(),
+                rejected: false,
+            };
+            let prepared = remote
+                .prepare(
+                    &remote.head().await.unwrap(),
+                    &BTreeMap::from([(artifact.path(), Some(artifact.text()))]),
+                    "Update fixture mapping",
+                )
+                .await
+                .unwrap();
+            remote.apply(&prepared).await.unwrap();
+            let commit = cache
+                .fetch_validated(remote.path().to_str().unwrap(), "main", applied.as_deref())
+                .await
+                .unwrap();
+            assert_eq!(commit, prepared.commit);
+            if number < 8 {
+                applied = Some(commit.clone());
+            }
+            commits.push(commit);
+        }
+        let current = commits.last().unwrap();
+        let previous = &commits[7];
+        assert_eq!(
+            cache
+                .text(
+                    &["rev-parse", "refs/trakkin/incoming", CACHE_APPLIED],
+                    None,
+                    None
+                )
+                .await
+                .unwrap(),
+            format!("{current}\n{previous}\n")
+        );
+        assert_eq!(
+            cache
+                .text(
+                    &["for-each-ref", "--format=%(refname)", "refs/trakkin/"],
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert!(cache.contains_commit(&commits[0]).await.unwrap());
+        let old = std::time::SystemTime::now() - Duration::from_secs(21 * 86400);
+        for directory in fs::read_dir(cache.path().join("objects")).unwrap() {
+            let directory = directory.unwrap();
+            if directory.file_type().unwrap().is_dir() {
+                for object in fs::read_dir(directory.path()).unwrap() {
+                    let object = object.unwrap();
+                    if object.file_type().unwrap().is_file() {
+                        fs::File::open(object.path())
+                            .unwrap()
+                            .set_modified(old)
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cache
+                .fetch_validated(remote.path().to_str().unwrap(), "main", applied.as_deref())
+                .await
+                .unwrap(),
+            *current
+        );
+        cache
+            .run(&["gc", "--quiet", "--prune=2.weeks.ago"], None, None)
+            .await
+            .unwrap();
+        assert!(!cache.contains_commit(&commits[0]).await.unwrap());
+        assert!(!cache.contains_commit(&commits[8]).await.unwrap());
+        assert!(cache.contains_commit(previous).await.unwrap());
+        assert_eq!(
+            cache
+                .delta(None, current)
+                .await
+                .unwrap()
+                .next_batch(1000)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        remote
+            .run(&["gc", "--quiet", "--prune=now"], None, None)
+            .await
+            .unwrap();
+        assert!(remote.contains_commit(&commits[0]).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn delta_pages_only_read_changed_claims_and_replay_prepared_commits() {
         let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::local(&directory.path().join("local"))
+        let repository = History::open(&directory.path().join("local"))
             .await
             .unwrap();
         let base = repository.head().await.unwrap();
@@ -1203,17 +1167,10 @@ mod tests {
         );
         repository.apply(&prepared).await.unwrap();
         repository.apply(&prepared).await.unwrap();
-        let first = repository
-            .changes(None, &prepared.commit, None, 2)
-            .await
-            .unwrap();
-        assert_eq!(first.changes.len(), 2);
-        let last = repository
-            .changes(None, &prepared.commit, first.next.as_deref(), 2)
-            .await
-            .unwrap();
-        assert_eq!(last.changes.len(), 1);
-        assert!(last.next.is_none());
+        let mut reader = repository.delta(None, &prepared.commit).await.unwrap();
+        assert_eq!(reader.next_batch(2).await.unwrap().len(), 2);
+        assert_eq!(reader.next_batch(2).await.unwrap().len(), 1);
+        assert!(reader.next_batch(2).await.unwrap().is_empty());
         let changes = BTreeMap::from([(artifacts[0].path(), None)]);
         let second = repository
             .prepare(&prepared.commit, &changes, "Delete one decision")
@@ -1221,26 +1178,29 @@ mod tests {
             .unwrap();
         repository.apply(&second).await.unwrap();
         let delta = repository
-            .changes(Some(&prepared.commit), &second.commit, None, 10)
+            .delta(Some(&prepared.commit), &second.commit)
+            .await
+            .unwrap()
+            .next_batch(10)
             .await
             .unwrap();
-        assert_eq!(delta.changes.len(), 1);
-        assert!(delta.changes[0].text.is_none());
-        fs::write(repository.path().join("scratch.trk"), "do not overwrite").unwrap();
-        assert!(matches!(
-            repository
-                .prepare(&second.commit, &BTreeMap::new(), "Dirty")
-                .await,
-            Err(WriteError::DirtyWorktree)
-        ));
+        assert_eq!(delta.len(), 1);
+        assert!(delta[0].text.is_none());
+        let unchanged = repository
+            .prepare(&second.commit, &BTreeMap::new(), "Unchanged")
+            .await
+            .unwrap();
+        assert_eq!(unchanged.commit, second.commit);
+        assert!(repository.path().join("HEAD").is_file());
+        assert!(!repository.path().join(".git").exists());
     }
 
     #[tokio::test]
     async fn pending_publications_survive_cache_loss_and_remote_pushes_use_a_lease() {
         let directory = tempfile::tempdir().unwrap();
         let cache = directory.path().join("cache.git");
-        let repository = Repository::publication(&cache).await.unwrap();
-        let remote = Repository::publication(&directory.path().join("remote.git"))
+        let repository = History::open(&cache).await.unwrap();
+        let remote = History::open(&directory.path().join("remote.git"))
             .await
             .unwrap();
         let artifact = Artifact {
@@ -1258,7 +1218,7 @@ mod tests {
         let stored = serde_json::to_vec(&prepared).unwrap();
         drop(repository);
         fs::remove_dir_all(&cache).unwrap();
-        let recovered = Repository::publication(&cache).await.unwrap();
+        let recovered = History::open(&cache).await.unwrap();
         let prepared: Prepared = serde_json::from_slice(&stored).unwrap();
         recovered.apply(&prepared).await.unwrap();
         assert_eq!(recovered.head().await.unwrap(), prepared.commit);

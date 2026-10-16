@@ -8,7 +8,7 @@ use std::{
 };
 use trakkin_mappings_corpus::{
     Artifact, ConflictPolicy,
-    git::Repository,
+    git::History,
     pipeline::{Action, Database, Review},
 };
 
@@ -129,19 +129,17 @@ impl Command {
             Operation::Validate { repository } => {
                 ensure!(repository.exists(), "publication repository does not exist");
                 let runtime = tokio::runtime::Runtime::new()?;
-                let repository = runtime.block_on(Repository::publication(&repository))?;
+                let repository = runtime.block_on(History::open(&repository))?;
                 let commit = runtime.block_on(repository.head())?;
                 runtime.block_on(repository.policy(&commit))?;
-                let mut after = None;
+                let mut delta = runtime.block_on(repository.delta(None, &commit))?;
                 let mut records = 0;
                 loop {
-                    let page = runtime.block_on(repository.changes(
-                        None,
-                        &commit,
-                        after.as_deref(),
-                        1000,
-                    ))?;
-                    for change in page.changes {
+                    let batch = runtime.block_on(delta.next_batch(1000))?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for change in batch {
                         if change.path != trakkin_mappings_corpus::POLICY {
                             Artifact::parse(
                                 &change.path,
@@ -149,10 +147,6 @@ impl Command {
                             )?;
                             records += 1;
                         }
-                    }
-                    after = page.next;
-                    if after.is_none() {
-                        break;
                     }
                 }
                 output(&json!({"commit":commit,"records":records}))
@@ -233,7 +227,7 @@ impl Command {
                         branch,
                     } => {
                         let runtime = tokio::runtime::Runtime::new()?;
-                        let repository = runtime.block_on(Repository::publication(&repository))?;
+                        let repository = runtime.block_on(History::open(&repository))?;
                         let report = if let Some(remote) = remote {
                             database.publish_to(
                                 &repository,

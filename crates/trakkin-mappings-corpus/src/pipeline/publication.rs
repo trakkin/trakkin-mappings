@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Artifact, POLICY, claim_path,
-    git::{Prepared, Repository},
+    git::{History, Prepared},
 };
 use tokio::runtime::Runtime;
 
@@ -53,7 +53,7 @@ impl PublicationBatch {
 impl Database {
     pub fn prepare_publication(
         &mut self,
-        repository: &Repository,
+        repository: &History,
         runtime: &Runtime,
         batch_size: usize,
     ) -> Result<Option<PendingPublication>> {
@@ -68,7 +68,7 @@ impl Database {
 
     fn prepare_for(
         &mut self,
-        repository: &Repository,
+        repository: &History,
         runtime: &Runtime,
         batch_size: usize,
         destination: &str,
@@ -195,7 +195,7 @@ impl Database {
 
     pub fn publish(
         &mut self,
-        repository: &Repository,
+        repository: &History,
         runtime: &Runtime,
         batch_size: usize,
     ) -> Result<PublishReport> {
@@ -204,7 +204,7 @@ impl Database {
 
     pub fn publish_to(
         &mut self,
-        repository: &Repository,
+        repository: &History,
         runtime: &Runtime,
         batch_size: usize,
         remote: &str,
@@ -216,7 +216,7 @@ impl Database {
 
     fn publish_guarded(
         &mut self,
-        repository: &Repository,
+        repository: &History,
         runtime: &Runtime,
         batch_size: usize,
         remote: Option<(&str, &str)>,
@@ -234,7 +234,7 @@ impl Database {
 
     fn publish_inner(
         &mut self,
-        repository: &Repository,
+        repository: &History,
         runtime: &Runtime,
         batch_size: usize,
         remote: Option<(&str, &str)>,

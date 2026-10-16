@@ -140,8 +140,8 @@ impl Database {
         for input in native_inputs {
             transaction.execute("INSERT INTO corpus.decision_inputs(version,source,revision,key,evidence) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",&[&version,&input.source,&input.revision,&input.key,&json!({"purpose":"selector-validation"})])?;
         }
-        if command.action == Action::Accepted && command.expected_candidate.is_some() {
-            transaction.execute("INSERT INTO corpus.decision_inputs(version,source,revision,key,evidence) SELECT $2,i.source,i.revision,i.key,jsonb_agg(s.evidence ORDER BY s.id) FROM corpus.supports s JOIN corpus.support_inputs i ON i.support_id=s.id WHERE s.claim_id=$1 GROUP BY i.source,i.revision,i.key ON CONFLICT DO NOTHING", &[&claim_id,&version])?;
+        if command.expected_candidate.is_some() {
+            transaction.execute("INSERT INTO corpus.decision_inputs(version,source,revision,key,evidence) SELECT $2,i.source,i.revision,i.key,jsonb_build_object('supports',jsonb_agg(jsonb_build_object('id',s.id,'method',s.method,'engine',s.engine,'evidence',s.evidence) ORDER BY s.id)) FROM corpus.supports s JOIN corpus.support_inputs i ON i.support_id=s.id WHERE s.claim_id=$1 GROUP BY i.source,i.revision,i.key ON CONFLICT(version,source,key) DO UPDATE SET evidence=corpus.decision_inputs.evidence || EXCLUDED.evidence", &[&claim_id,&version])?;
         }
         refresh_footprint(&mut transaction, &claim_id)?;
         transaction.commit()?;
