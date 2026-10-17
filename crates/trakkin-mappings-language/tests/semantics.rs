@@ -1,6 +1,7 @@
 use trakkin_mappings_language::{
-    ResolvedSelection, Resolver, Selection, Selector, SemanticError, SemanticErrorKind, Value,
-    evaluate, parse_record,
+    CorrespondenceCapture, CorrespondenceError, CorrespondenceLimits, CorrespondenceRelation,
+    RationalPosition, ResolvedSelection, Resolver, Selection, Selector, SemanticError,
+    SemanticErrorKind, Value, compile_correspondence, evaluate, parse_record,
 };
 
 struct Fixture;
@@ -41,6 +42,251 @@ impl Resolver for Fixture {
             }),
         })
     }
+}
+
+fn capture() -> CorrespondenceCapture {
+    CorrespondenceCapture {
+        mapping_revision: "mappings-1".to_owned(),
+        reference_revisions: [
+            ("a".to_owned(), "a-1".to_owned()),
+            ("b".to_owned(), "b-1".to_owned()),
+        ]
+        .into(),
+    }
+}
+
+#[test]
+fn correspondence_compiles_exact_rational_three_to_two_coverage() {
+    let statement = parse_record("[a://1 @2,a://2 @2,a://3 @2] <~> [b://1 @3,b://2 @3]")
+        .unwrap()
+        .statement;
+    let compiled = compile_correspondence(
+        &statement,
+        &Fixture,
+        capture(),
+        CorrespondenceLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(compiled.capture(), &capture());
+    let CorrespondenceRelation::OrderedCoverage(segments) = compiled.relation() else {
+        panic!("expected ordered coverage");
+    };
+    assert_eq!(segments.len(), 4);
+    assert_eq!(segments[0].left.start, RationalPosition::from_integer(0));
+    assert_eq!(segments[0].left.end, RationalPosition::from_integer(1));
+    assert_eq!(segments[0].right.end, RationalPosition::new(2, 3));
+    assert_eq!(segments[1].left.end, RationalPosition::new(1, 2));
+    assert_eq!(segments[2].left.start, RationalPosition::new(1, 2));
+    assert!(compiled.left_tail().unmapped.is_empty());
+    assert!(!compiled.right_tail().open);
+    for scale in [2, 3, 17, 1_000_000] {
+        let mut scaled = statement.clone();
+        for expression in [&mut scaled.left, &mut scaled.right] {
+            let trakkin_mappings_language::Expression::Composite(selections) = expression else {
+                unreachable!();
+            };
+            for expression in selections {
+                let trakkin_mappings_language::Expression::Selection(selection) = expression else {
+                    unreachable!();
+                };
+                selection.extent =
+                    std::num::NonZeroU64::new(selection.extent.get() * scale).unwrap();
+            }
+        }
+        assert_eq!(
+            compiled,
+            compile_correspondence(
+                &scaled,
+                &Fixture,
+                capture(),
+                CorrespondenceLimits::default()
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn correspondence_retains_group_semantics_direction_and_unknown_tails() {
+    let compile = |text| {
+        compile_correspondence(
+            &parse_record(text).unwrap().statement,
+            &Fixture,
+            capture(),
+            CorrespondenceLimits::default(),
+        )
+        .unwrap()
+    };
+    assert!(
+        matches!(compile("a://1 <=> b://1").relation(), CorrespondenceRelation::Exact(pairs) if pairs.len() == 1)
+    );
+    assert!(
+        matches!(compile("a://1 @2 <~> b://2 :: unit={1,2}").relation(),
+        CorrespondenceRelation::UnorderedCoverage { left, right } if left.len() == 1 && right.len() == 2)
+    );
+    let implication = compile("a://x :: unit=* => b://y :: unit=1..2");
+    assert!(
+        matches!(implication.relation(), CorrespondenceRelation::PositiveImplication(segments)
+        if segments.iter().all(|segment| segment.left.reference.starts_with("a://") && segment.right.reference.starts_with("b://")))
+    );
+    assert!(implication.left_tail().open);
+    assert_eq!(implication.left_tail().unmapped.len(), 1);
+    assert!(!implication.right_tail().open);
+}
+
+#[test]
+fn correspondence_bounds_fail_without_a_partial_artifact() {
+    let statement = parse_record("a://x :: unit=* => b://y :: unit=1..2")
+        .unwrap()
+        .statement;
+    for limits in [
+        CorrespondenceLimits {
+            maximum_members: 1,
+            ..CorrespondenceLimits::default()
+        },
+        CorrespondenceLimits {
+            maximum_work: 1,
+            ..CorrespondenceLimits::default()
+        },
+        CorrespondenceLimits {
+            maximum_depth: 0,
+            ..CorrespondenceLimits::default()
+        },
+    ] {
+        assert_eq!(
+            compile_correspondence(&statement, &Fixture, capture(), limits),
+            Err(CorrespondenceError::LimitExceeded)
+        );
+    }
+    let mut missing_revision = capture();
+    missing_revision.reference_revisions.remove("b");
+    assert_eq!(
+        compile_correspondence(
+            &statement,
+            &Fixture,
+            missing_revision,
+            CorrespondenceLimits::default()
+        ),
+        Err(CorrespondenceError::InvalidCapture)
+    );
+}
+
+#[test]
+fn correspondence_ordered_partitions_match_an_independent_integer_cell_oracle() {
+    use trakkin_mappings_language::{MaterialAlignment, UnitSpan};
+
+    for left_count in 1..=6_u64 {
+        for right_count in 1..=6_u64 {
+            let expression = |source, count, extent| {
+                format!(
+                    "[{}]",
+                    (0..count)
+                        .map(|index| format!("{source}://{index} @{extent}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            let statement = parse_record(&format!(
+                "{} <~> {}",
+                expression("a", left_count, right_count),
+                expression("b", right_count, left_count)
+            ))
+            .unwrap()
+            .statement;
+            let compiled = compile_correspondence(
+                &statement,
+                &Fixture,
+                capture(),
+                CorrespondenceLimits::default(),
+            )
+            .unwrap();
+            let mut cells: Vec<(u64, u64, u64, u64)> = Vec::new();
+            for position in 0..left_count * right_count {
+                let left_index = position / right_count;
+                let right_index = position / left_count;
+                if let Some(last) = cells.last_mut()
+                    && last.0 == left_index
+                    && last.1 == right_index
+                {
+                    last.3 = position + 1;
+                } else {
+                    cells.push((left_index, right_index, position, position + 1));
+                }
+            }
+            let expected: Vec<_> = cells
+                .into_iter()
+                .map(|(left, right, start, end)| MaterialAlignment {
+                    left: UnitSpan {
+                        reference: format!("a://{left}"),
+                        start: RationalPosition::new(start - left * right_count, right_count),
+                        end: RationalPosition::new(end - left * right_count, right_count),
+                    },
+                    right: UnitSpan {
+                        reference: format!("b://{right}"),
+                        start: RationalPosition::new(start - right * left_count, left_count),
+                        end: RationalPosition::new(end - right * left_count, left_count),
+                    },
+                })
+                .collect();
+            assert_eq!(
+                compiled.relation(),
+                &CorrespondenceRelation::OrderedCoverage(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn correspondence_nested_resolution_obeys_the_hard_depth_limit() {
+    let mut statement = parse_record("a://x <=> b://y").unwrap().statement;
+    for _ in 0..129 {
+        statement.left = trakkin_mappings_language::Expression::Composite(vec![statement.left]);
+    }
+    assert_eq!(
+        compile_correspondence(
+            &statement,
+            &Fixture,
+            capture(),
+            CorrespondenceLimits {
+                maximum_depth: usize::MAX,
+                ..CorrespondenceLimits::default()
+            }
+        ),
+        Err(CorrespondenceError::LimitExceeded)
+    );
+}
+
+#[test]
+fn correspondence_unordered_group_identity_is_independent_of_resolver_order() {
+    struct Reversed;
+    impl Resolver for Reversed {
+        fn resolve(&self, selection: &Selection) -> Result<ResolvedSelection, SemanticError> {
+            let mut resolved = Fixture.resolve(selection)?;
+            if !resolved.ordered {
+                resolved.units.reverse();
+            }
+            Ok(resolved)
+        }
+    }
+    let statement = parse_record("a://x @2 <~> b://y :: unit={1,2}")
+        .unwrap()
+        .statement;
+    assert_eq!(
+        compile_correspondence(
+            &statement,
+            &Fixture,
+            capture(),
+            CorrespondenceLimits::default()
+        )
+        .unwrap(),
+        compile_correspondence(
+            &statement,
+            &Reversed,
+            capture(),
+            CorrespondenceLimits::default()
+        )
+        .unwrap()
+    );
 }
 
 #[test]

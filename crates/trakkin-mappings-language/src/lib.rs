@@ -1,7 +1,13 @@
+mod correspondence;
 mod documents;
 mod parsing;
 mod semantics;
 
+pub use correspondence::{
+    Correspondence, CorrespondenceCapture, CorrespondenceError, CorrespondenceLimits,
+    CorrespondenceRelation, CorrespondenceTail, MaterialAlignment, RationalPosition, UnitPair,
+    UnitSpan, compile_correspondence,
+};
 pub use documents::{Decision, Decisions};
 pub use parsing::{parse, parse_reference};
 pub use semantics::{
@@ -35,6 +41,7 @@ pub fn semantic_revision() -> String {
             sha256(
                 &[
                     include_bytes!("lib.rs").as_slice(),
+                    include_bytes!("correspondence.rs").as_slice(),
                     include_bytes!("documents.rs").as_slice(),
                     include_bytes!("parsing.rs").as_slice(),
                     include_bytes!("semantics.rs").as_slice(),
