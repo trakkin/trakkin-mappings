@@ -372,16 +372,15 @@ impl Tmdb {
                         let address = format!("episode:{show}/{number}/{episode_number}");
                         let season_matches = episode["season_number"].as_u64() == Some(number);
                         let show_matches = episode["show_id"].as_u64() == show.parse::<u64>().ok();
-                        let verified = if season_matches && !show_matches {
+                        let verified = if !season_matches || !show_matches {
                             fetch_address(&self.http, &self.token, &self.endpoint, &address)?
                         } else {
                             None
                         };
                         ensure!(
-                            season_matches
-                                && (show_matches
-                                    || verified.as_ref().and_then(|record| record["id"].as_u64())
-                                        == Some(episode_id)),
+                            (season_matches && show_matches)
+                                || verified.as_ref().and_then(|record| record["id"].as_u64())
+                                    == Some(episode_id),
                             "TMDB episode {episode_id} at episode:{show}/{number}/{episode_number} belongs to another season or show (season_number={}, show_id={})",
                             episode["season_number"],
                             episode["show_id"]

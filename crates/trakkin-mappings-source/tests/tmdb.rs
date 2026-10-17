@@ -207,6 +207,10 @@ fn episode_hierarchy_mismatches_report_address_and_upstream_parentage() {
             200,
         ),
         (
+            json!({"id":100,"episode_number":1,"season_number":2,"show_id":1}),
+            404,
+        ),
+        (
             json!({"id":100,"episode_number":1,"season_number":0,"show_id":2}),
             200,
         ),
@@ -220,7 +224,7 @@ fn episode_hierarchy_mismatches_report_address_and_upstream_parentage() {
             404,
         ),
     ] {
-        let mut replies = vec![
+        let replies = vec![
             reply(
                 "/tv/changes?page=1",
                 json!({"results":[{"id":1}],"total_pages":1}),
@@ -233,16 +237,14 @@ fn episode_hierarchy_mismatches_report_address_and_upstream_parentage() {
                 "/tv/1/season/0?",
                 json!({"id":10,"season_number":0,"episodes":[episode]}),
             ),
-        ];
-        if episode["season_number"] == 0 {
-            replies.push(Reply {
+            Reply {
                 status,
                 ..reply(
                     "/tv/1/season/0/episode/1?",
                     json!({"id":101,"episode_number":1,"season_number":0}),
                 )
-            });
-        }
+            },
+        ];
         let (endpoint, handle) = server(replies);
         let mut provider = Tmdb::with_endpoints(
             "fixture".into(),
@@ -267,11 +269,14 @@ fn episode_hierarchy_mismatches_report_address_and_upstream_parentage() {
 }
 
 #[test]
-fn episode_bootstrap_verifies_unreliable_show_ids_with_native_details() {
+fn episode_bootstrap_verifies_unreliable_parentage_with_native_details() {
     for episode in [
         json!({"id":317139,"episode_number":1,"season_number":12,"show_id":4498}),
         json!({"id":317139,"episode_number":1,"season_number":12}),
         json!({"id":317139,"episode_number":1,"season_number":12,"show_id":null}),
+        json!({"id":317139,"episode_number":1,"season_number":2016,"show_id":4498}),
+        json!({"id":317139,"episode_number":1,"show_id":45}),
+        json!({"id":317139,"episode_number":1,"season_number":null,"show_id":45}),
     ] {
         let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
         writeln!(gzip, "{{\"id\":45}}").unwrap();
@@ -317,6 +322,53 @@ fn episode_bootstrap_verifies_unreliable_show_ids_with_native_details() {
         );
         handle.join().unwrap();
     }
+}
+
+#[test]
+fn episode_bootstrap_verifies_unreliable_season_numbers_with_native_details() {
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    writeln!(gzip, "{{\"id\":15871}}").unwrap();
+    let (endpoint, handle) = server(vec![
+        Reply {
+            status: 200,
+            body: gzip.finish().unwrap(),
+            expected: "tv_series_ids_01_02_1970",
+        },
+        reply(
+            "/tv/15871?",
+            json!({"id":15871,"seasons":[{"id":64,"season_number":29}]}),
+        ),
+        reply(
+            "/tv/15871/season/29?",
+            json!({"id":64,"season_number":29,"episodes":[{"id":1343952,"episode_number":17,"season_number":2016,"show_id":15871}]}),
+        ),
+        reply(
+            "/tv/15871/season/29/episode/17?",
+            json!({"id":1343952,"episode_number":17,"season_number":29,"external_ids":{"tvdb_id":12}}),
+        ),
+    ]);
+    let mut provider = Tmdb::with_endpoints(
+        "fixture".into(),
+        &["tv", "season", "episode"],
+        &endpoint,
+        &endpoint,
+    )
+    .unwrap();
+    let page = provider
+        .discover(Mode::Full, None, &Value::Null, 172800)
+        .unwrap();
+    assert_eq!(page.changes.len(), 3);
+    assert!(matches!(&page.changes[2], Change::Dirty(key) if key == "episode:1343952"));
+    assert_eq!(
+        provider.descriptor("episode:1343952").unwrap(),
+        json!({"address":"episode:15871/29/17","parent":"tv:15871","season_id":64})
+    );
+    let records = common::fetch_many(&mut provider, &["episode:1343952".into()]).unwrap();
+    assert_eq!(
+        records["episode:1343952"].as_ref().unwrap()["external_ids"]["tvdb_id"],
+        12
+    );
+    handle.join().unwrap();
 }
 
 #[test]
