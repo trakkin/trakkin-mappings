@@ -1,7 +1,8 @@
 use trakkin_mappings_language::{
     CorrespondenceCapture, CorrespondenceError, CorrespondenceLimits, CorrespondenceRelation,
-    RationalPosition, ResolvedSelection, Resolver, Selection, Selector, SemanticError,
-    SemanticErrorKind, Value, compile_correspondence, evaluate, parse_record,
+    MaterialGraphError, RationalPosition, ResolvedSelection, Resolver, Selection, Selector,
+    SemanticError, SemanticErrorKind, Value, build_material_graph, compile_correspondence,
+    evaluate, parse_record,
 };
 
 struct Fixture;
@@ -53,6 +54,117 @@ fn capture() -> CorrespondenceCapture {
         ]
         .into(),
     }
+}
+
+#[test]
+fn material_graph_joins_only_explicitly_aligned_fragments() {
+    let compile = |text| {
+        compile_correspondence(
+            &parse_record(text).unwrap().statement,
+            &Fixture,
+            capture(),
+            CorrespondenceLimits::default(),
+        )
+        .unwrap()
+    };
+    let graph = build_material_graph(
+        &Default::default(),
+        &[compile("a://double @2 <~> [b://first,b://second]")],
+        capture(),
+        CorrespondenceLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.atom_count(), 2);
+    let parts: std::collections::BTreeSet<_> = graph
+        .unit("b://first")
+        .unwrap()
+        .union(graph.unit("b://second").unwrap())
+        .copied()
+        .collect();
+    assert_eq!(graph.unit("a://double"), Some(&parts));
+    assert!(
+        graph
+            .unit("b://first")
+            .unwrap()
+            .is_disjoint(graph.unit("b://second").unwrap())
+    );
+    let graph = build_material_graph(
+        &Default::default(),
+        &[
+            compile("a://double @2 <~> b://set :: unit={1,2}"),
+            compile("a://extended => b://cut"),
+        ],
+        capture(),
+        CorrespondenceLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.groups().len(), 1);
+    assert_eq!(graph.implications().len(), 1);
+    assert_ne!(graph.unit("a://extended"), graph.unit("b://cut"));
+}
+
+#[test]
+fn material_graph_propagates_boundaries_and_rejects_conflicting_claims() {
+    let compile = |text| {
+        compile_correspondence(
+            &parse_record(text).unwrap().statement,
+            &Fixture,
+            capture(),
+            CorrespondenceLimits::default(),
+        )
+        .unwrap()
+    };
+    let claims = [
+        compile("a://double @2 <~> [b://first,b://second]"),
+        compile("a://alias <=> b://first"),
+        compile("a://alias <=> b://second"),
+    ];
+    assert!(matches!(
+        build_material_graph(
+            &Default::default(),
+            &claims,
+            capture(),
+            CorrespondenceLimits::default()
+        ),
+        Err(MaterialGraphError::Conflicting { .. })
+    ));
+    let claims = [compile(
+        "[a://1 @2,a://2 @2,a://3 @2] <~> [b://1 @3,b://2 @3]",
+    )];
+    let graph = build_material_graph(
+        &Default::default(),
+        &claims,
+        capture(),
+        CorrespondenceLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.atom_count(), 4);
+    assert_eq!(graph.unit("b://1").unwrap().len(), 2);
+    assert!(matches!(
+        build_material_graph(
+            &Default::default(),
+            &claims,
+            capture(),
+            CorrespondenceLimits {
+                maximum_members: 2,
+                ..CorrespondenceLimits::default()
+            }
+        ),
+        Err(MaterialGraphError::LimitExceeded)
+    ));
+    let mut changed = capture();
+    changed
+        .reference_revisions
+        .insert("a".to_owned(), "changed".to_owned());
+    assert_eq!(
+        build_material_graph(
+            &Default::default(),
+            &claims,
+            changed,
+            CorrespondenceLimits::default()
+        ),
+        Err(MaterialGraphError::InvalidCapture)
+    );
 }
 
 #[test]

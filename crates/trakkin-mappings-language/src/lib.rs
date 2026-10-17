@@ -1,5 +1,6 @@
 mod correspondence;
 mod documents;
+mod material;
 mod parsing;
 mod semantics;
 
@@ -9,6 +10,7 @@ pub use correspondence::{
     UnitSpan, compile_correspondence,
 };
 pub use documents::{Decision, Decisions};
+pub use material::{MaterialGraph, MaterialGraphError, MaterialRule, build_material_graph};
 pub use parsing::{parse, parse_reference};
 pub use semantics::{
     Alignment, Evaluation, Member, ResolvedExpression, ResolvedSelection, Resolver, SemanticError,
@@ -43,6 +45,7 @@ pub fn semantic_revision() -> String {
                     include_bytes!("lib.rs").as_slice(),
                     include_bytes!("correspondence.rs").as_slice(),
                     include_bytes!("documents.rs").as_slice(),
+                    include_bytes!("material.rs").as_slice(),
                     include_bytes!("parsing.rs").as_slice(),
                     include_bytes!("semantics.rs").as_slice(),
                     include_bytes!("../grammar/Trakkin.g4").as_slice(),
